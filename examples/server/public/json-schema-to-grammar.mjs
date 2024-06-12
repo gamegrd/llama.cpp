@@ -1,33 +1,62 @@
-// WARNING: This file was ported from json-schema-to-grammar.py, please fix bugs / add features there first.
-const SPACE_RULE = '" "?';
+// WARNING: This file was ported from json_schema_to_grammar.py, please fix bugs / add features there first.
+const SPACE_RULE = '| " " | "\\n" [ \\t]{0,20}';
+
+function _buildRepetition(itemRule, minItems, maxItems, opts={}) {
+  if (minItems === 0 && maxItems === 1) {
+    return `${itemRule}?`;
+  }
+
+
+  const separatorRule = opts.separatorRule ?? '';
+  const itemRuleIsLiteral = opts.itemRuleIsLiteral ?? false
+
+  if (separatorRule === '') {
+    if (minItems === 1 && maxItems === undefined) {
+      return `${itemRule}+`;
+    } else if (minItems === 0 && maxItems === undefined) {
+      return `${itemRule}*`;
+    } else {
+      return `${itemRule}{${minItems},${maxItems !== undefined ? maxItems : ''}}`;
+    }
+  }
+
+  const result = itemRule + ' ' + _buildRepetition(`(${separatorRule} ${itemRule})`, minItems > 0 ? minItems - 1 : 0, maxItems !== undefined ? maxItems - 1 : undefined);
+  return minItems === 0 ? `(${result})?` : result;
+}
+
+class BuiltinRule {
+  constructor(content, deps) {
+    this.content = content;
+    this.deps = deps || [];
+  }
+}
 
 const PRIMITIVE_RULES = {
-  boolean: '("true" | "false") space',
-  number: '("-"? ([0-9] | [1-9] [0-9]*)) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? space',
-  integer: '("-"? ([0-9] | [1-9] [0-9]*)) space',
-  value: 'object | array | string | number | boolean',
-  object: '"{" space ( string ":" space value ("," space string ":" space value)* )? "}" space',
-  array: '"[" space ( value ("," space value)* )? "]" space',
-  uuid: '"\\"" ' + [8, 4, 4, 4, 12].map(n => [...new Array(n)].map(_ => '[0-9a-fA-F]').join('')).join(' "-" ') + ' "\\"" space',
-  string: ` "\\"" (
-        [^"\\\\] |
-        "\\\\" (["\\\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])
-      )* "\\"" space`,
-  null: '"null" space',
+  boolean        : new BuiltinRule('("true" | "false") space', []),
+  'decimal-part' : new BuiltinRule('[0-9]{1,16}', []),
+  'integral-part': new BuiltinRule('[0] | [1-9] [0-9]{0,15}', []),
+  number         : new BuiltinRule('("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)? space', ['integral-part', 'decimal-part']),
+  integer        : new BuiltinRule('("-"? integral-part) space', ['integral-part']),
+  value          : new BuiltinRule('object | array | string | number | boolean | null', ['object', 'array', 'string', 'number', 'boolean', 'null']),
+  object         : new BuiltinRule('"{" space ( string ":" space value ("," space string ":" space value)* )? "}" space', ['string', 'value']),
+  array          : new BuiltinRule('"[" space ( value ("," space value)* )? "]" space', ['value']),
+  uuid           : new BuiltinRule('"\\"" [0-9a-fA-F]{8} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{12} "\\"" space', []),
+  char           : new BuiltinRule(`[^"\\\\\\x7F\\x00-\\x1F] | [\\\\] (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})`, []),
+  string         : new BuiltinRule(`"\\"" char* "\\"" space`, ['char']),
+  null           : new BuiltinRule('"null" space', []),
 };
-const OBJECT_RULE_NAMES = ['object', 'array', 'string', 'number', 'boolean', 'null', 'value'];
 
 // TODO: support "uri", "email" string formats
-const DATE_RULES = {
-    'date'   : '[0-9] [0-9] [0-9] [0-9] "-" ( "0" [1-9] | "1" [0-2] ) "-" ( \"0\" [1-9] | [1-2] [0-9] | "3" [0-1] )',
-    'time'   : '([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] ":" [0-5] [0-9] ( "." [0-9] [0-9] [0-9] )? ( "Z" | ( "+" | "-" ) ( [01] [0-9] | "2" [0-3] ) ":" [0-5] [0-9] )',
-    'date-time': 'date "T" time',
-    'date-string': '"\\"" date "\\"" space',
-    'time-string': '"\\"" time "\\"" space',
-    'date-time-string': '"\\"" date-time "\\"" space',
-};
+const STRING_FORMAT_RULES = {
+  'date'            : new BuiltinRule('[0-9]{4} "-" ( "0" [1-9] | "1" [0-2] ) "-" ( \"0\" [1-9] | [1-2] [0-9] | "3" [0-1] )', []),
+  'time'            : new BuiltinRule('([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] ":" [0-5] [0-9] ( "." [0-9]{3} )? ( "Z" | ( "+" | "-" ) ( [01] [0-9] | "2" [0-3] ) ":" [0-5] [0-9] )', []),
+  'date-time'       : new BuiltinRule('date "T" time', ['date', 'time']),
+  'date-string'     : new BuiltinRule('"\\"" date "\\"" space', ['date']),
+  'time-string'     : new BuiltinRule('"\\"" time "\\"" space', ['time']),
+  'date-time-string': new BuiltinRule('"\\"" date-time "\\"" space', ['date-time']),
+}
 
-const RESERVED_NAMES = {'root': true, ...PRIMITIVE_RULES, ...DATE_RULES};
+const RESERVED_NAMES = {'root': true, ...PRIMITIVE_RULES, ...STRING_FORMAT_RULES};
 
 const INVALID_RULE_CHARS_RE = /[^\dA-Za-z-]+/g;
 const GRAMMAR_LITERAL_ESCAPE_RE = /[\n\r"]/g;
@@ -158,7 +187,7 @@ export class SchemaConverter {
         rule = '[\\U00000000-\\U0010FFFF]';
       } else {
         // Accept any character... except \n and \r line break chars (\x0A and \xOD)
-        rule = '[\\U00000000-\\x09\\x0B\\x0C\\x0E-\\U0010FFFF]';
+        rule = '[^\\x0A\\x0D]';
       }
       return this._addRule('dot', rule);
     };
@@ -259,26 +288,19 @@ export class SchemaConverter {
 
           let [sub, subIsLiteral] = seq[seq.length - 1];
 
-          if (minTimes === 0 && maxTimes === Infinity) {
-            seq[seq.length - 1] = [`${sub}*`, false];
-          } else if (minTimes === 0 && maxTimes === 1) {
-            seq[seq.length - 1] = [`${sub}?`, false];
-          } else if (minTimes === 1 && maxTimes === Infinity) {
-            seq[seq.length - 1] = [`${sub}+`, false];
-          } else {
-            if (!subIsLiteral) {
-              let id = subRuleIds[sub];
-              if (id === undefined) {
-                id = this._addRule(`${name}-${Object.keys(subRuleIds).length + 1}`, sub);
-                subRuleIds[sub] = id;
-              }
-              sub = id;
+          if (!subIsLiteral) {
+            let id = subRuleIds[sub];
+            if (id === undefined) {
+              id = this._addRule(`${name}-${Object.keys(subRuleIds).length + 1}`, sub);
+              subRuleIds[sub] = id;
             }
-
-            const repeatedSub = Array.from({ length: minTimes }, () => subIsLiteral ? `"${sub.slice(1, -1).repeat(minTimes)}"` : sub);
-            const optionalSub = maxTimes !== undefined ? Array.from({ length: maxTimes - minTimes }, () => `${sub}?`) : [`${sub}*`];
-            seq[seq.length - 1] = [repeatedSub.concat(optionalSub).join(' '), false];
+            sub = id;
           }
+
+          seq[seq.length - 1] = [
+            _buildRepetition(subIsLiteral ? `"${sub}"` : sub, minTimes, maxTimes, {itemRuleIsLiteral: subIsLiteral}),
+            false
+          ];
         } else {
           let literal = '';
           while (i < length) {
@@ -394,47 +416,48 @@ export class SchemaConverter {
         );
       } else {
         const itemRuleName = this.visit(items, `${name ?? ''}${name ? '-' : ''}item`);
-        const listItemOperator = `( "," space ${itemRuleName} )`;
-        let successiveItems = '';
-        let minItems = schema.minItems || 0;
+        const minItems = schema.minItems || 0;
         const maxItems = schema.maxItems;
-        if (minItems > 0) {
-          successiveItems = listItemOperator.repeat(minItems - 1);
-          minItems--;
-        }
-        if (maxItems !== undefined && maxItems > minItems) {
-          successiveItems += `${listItemOperator}?`.repeat(maxItems - minItems - 1);
-        } else {
-          successiveItems += `${listItemOperator}*`;
-        }
-        const rule = minItems === 0
-          ? `"[" space ( ${itemRuleName} ${successiveItems} )? "]" space`
-          : `"[" space ${itemRuleName} ${successiveItems} "]" space`;
-        return this._addRule(ruleName, rule);
+        return this._addRule(ruleName, '"[" space ' + _buildRepetition(itemRuleName, minItems, maxItems, {separatorRule: '"," space'}) + ' "]" space');
       }
     } else if ((schemaType === undefined || schemaType === 'string') && 'pattern' in schema) {
       return this._visitPattern(schema.pattern, ruleName);
     } else if ((schemaType === undefined || schemaType === 'string') && /^uuid[1-5]?$/.test(schema.format || '')) {
-      return this._addRule(
-          ruleName === 'root' ? 'root' : schemaFormat,
-          PRIMITIVE_RULES['uuid'])
-    } else if ((schemaType === undefined || schemaType === 'string') && schema.format in DATE_RULES) {
-      for (const [t, r] of Object.entries(DATE_RULES)) {
-        this._addRule(t, r);
-      }
-      return schemaFormat + '-string';
+      return this._addPrimitive(
+        ruleName === 'root' ? 'root' : schemaFormat,
+        PRIMITIVE_RULES['uuid']
+      );
+    } else if ((schemaType === undefined || schemaType === 'string') && `${schema.format}-string` in STRING_FORMAT_RULES) {
+      const primName = `${schema.format}-string`
+      return this._addRule(ruleName, this._addPrimitive(primName, STRING_FORMAT_RULES[primName]));
+    } else if (schemaType === 'string' && ('minLength' in schema || 'maxLength' in schema)) {
+      const charRuleName = this._addPrimitive('char', PRIMITIVE_RULES['char']);
+      const minLen = schema.minLength || 0;
+      const maxLen = schema.maxLength;
+      return this._addRule(ruleName, '"\\\"" ' + _buildRepetition(charRuleName, minLen, maxLen) + ' "\\\"" space');
     } else if ((schemaType === 'object') || (Object.keys(schema).length === 0)) {
-      for (const n of OBJECT_RULE_NAMES) {
-        this._addRule(n, PRIMITIVE_RULES[n]);
-      }
-      return this._addRule(ruleName, 'object');
+      return this._addRule(ruleName, this._addPrimitive('object', PRIMITIVE_RULES['object']));
     } else {
       if (!(schemaType in PRIMITIVE_RULES)) {
         throw new Error(`Unrecognized schema: ${JSON.stringify(schema)}`);
       }
       // TODO: support minimum, maximum, exclusiveMinimum, exclusiveMaximum at least for zero
-      return this._addRule(ruleName === 'root' ? 'root' : schemaType, PRIMITIVE_RULES[schemaType]);
+      return this._addPrimitive(ruleName === 'root' ? 'root' : schemaType, PRIMITIVE_RULES[schemaType]);
     }
+  }
+
+  _addPrimitive(name, rule) {
+    let n = this._addRule(name, rule.content);
+    for (const dep of rule.deps) {
+      const depRule = PRIMITIVE_RULES[dep] || STRING_FORMAT_RULES[dep];
+      if (!depRule) {
+        throw new Error(`Rule ${dep} not known`);
+      }
+      if (!(dep in this._rules)) {
+        this._addPrimitive(dep, depRule);
+      }
+    }
+    return n;
   }
 
   _buildObjectRule(properties, required, name, additionalProperties) {
@@ -462,7 +485,7 @@ export class SchemaConverter {
       const valueRule = this.visit(additionalProperties === true ? {} : additionalProperties, `${subName}-value`);
       propKvRuleNames['*'] = this._addRule(
         `${subName}-kv`,
-        `${this._addRule('string', PRIMITIVE_RULES['string'])} ":" space ${valueRule}`);
+        `${this._addPrimitive('string', PRIMITIVE_RULES['string'])} ":" space ${valueRule}`);
       optionalProps.push('*');
     }
 

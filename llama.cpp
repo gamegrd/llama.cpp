@@ -7,10 +7,12 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
-#ifdef GGML_USE_CUBLAS
+#ifdef GGML_USE_RPC
+#  include "ggml-rpc.h"
+#endif
+
+#ifdef GGML_USE_CUDA
 #  include "ggml-cuda.h"
-#elif defined(GGML_USE_CLBLAST)
-#  include "ggml-opencl.h"
 #elif defined(GGML_USE_VULKAN)
 #  include "ggml-vulkan.h"
 #elif defined(GGML_USE_SYCL)
@@ -22,16 +24,9 @@
 #ifdef GGML_USE_METAL
 #  include "ggml-metal.h"
 #endif
-#ifdef GGML_USE_MPI
-#  include "ggml-mpi.h"
-#endif
-#ifndef QK_K
-#  ifdef GGML_QKK_64
-#    define QK_K 64
-#  else
-#    define QK_K 256
-#  endif
-#endif
+
+// TODO: replace with ggml API call
+#define QK_K 256
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -61,6 +56,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <cfloat>
 #include <cinttypes>
 #include <climits>
@@ -71,10 +67,10 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <cwctype>
 #include <forward_list>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <initializer_list>
 #include <locale>
 #include <map>
@@ -105,15 +101,14 @@
 #endif
 
 #define LLAMA_MAX_NODES   8192
-#define LLAMA_MAX_EXPERTS 8
-
+#define LLAMA_MAX_EXPERTS 160
 
 //
 // logging
 //
 
 LLAMA_ATTRIBUTE_FORMAT(2, 3)
-static void llama_log_internal        (ggml_log_level level, const char* format, ...);
+static void llama_log_internal        (ggml_log_level level, const char * format, ...);
 static void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data);
 
 #define LLAMA_LOG_INFO(...)  llama_log_internal(GGML_LOG_LEVEL_INFO , __VA_ARGS__)
@@ -201,15 +196,17 @@ enum llm_arch {
     LLM_ARCH_GPTNEOX,
     LLM_ARCH_MPT,
     LLM_ARCH_STARCODER,
-    LLM_ARCH_PERSIMMON,
     LLM_ARCH_REFACT,
     LLM_ARCH_BERT,
     LLM_ARCH_NOMIC_BERT,
+    LLM_ARCH_JINA_BERT_V2,
     LLM_ARCH_BLOOM,
     LLM_ARCH_STABLELM,
     LLM_ARCH_QWEN,
     LLM_ARCH_QWEN2,
+    LLM_ARCH_QWEN2MOE,
     LLM_ARCH_PHI2,
+    LLM_ARCH_PHI3,
     LLM_ARCH_PLAMO,
     LLM_ARCH_CODESHELL,
     LLM_ARCH_ORION,
@@ -218,39 +215,51 @@ enum llm_arch {
     LLM_ARCH_GEMMA,
     LLM_ARCH_STARCODER2,
     LLM_ARCH_MAMBA,
+    LLM_ARCH_XVERSE,
     LLM_ARCH_COMMAND_R,
+    LLM_ARCH_DBRX,
+    LLM_ARCH_OLMO,
+    LLM_ARCH_ARCTIC,
+    LLM_ARCH_DEEPSEEK2,
     LLM_ARCH_UNKNOWN,
 };
 
 static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
-    { LLM_ARCH_LLAMA,           "llama"      },
-    { LLM_ARCH_FALCON,          "falcon"     },
-    { LLM_ARCH_GROK,            "grok"       },
-    { LLM_ARCH_GPT2,            "gpt2"       },
-    { LLM_ARCH_GPTJ,            "gptj"       },
-    { LLM_ARCH_GPTNEOX,         "gptneox"    },
-    { LLM_ARCH_MPT,             "mpt"        },
-    { LLM_ARCH_BAICHUAN,        "baichuan"   },
-    { LLM_ARCH_STARCODER,       "starcoder"  },
-    { LLM_ARCH_PERSIMMON,       "persimmon"  },
-    { LLM_ARCH_REFACT,          "refact"     },
-    { LLM_ARCH_BERT,            "bert"       },
-    { LLM_ARCH_NOMIC_BERT,      "nomic-bert" },
-    { LLM_ARCH_BLOOM,           "bloom"      },
-    { LLM_ARCH_STABLELM,        "stablelm"   },
-    { LLM_ARCH_QWEN,            "qwen"       },
-    { LLM_ARCH_QWEN2,           "qwen2"      },
-    { LLM_ARCH_PHI2,            "phi2"       },
-    { LLM_ARCH_PLAMO,           "plamo"      },
-    { LLM_ARCH_CODESHELL,       "codeshell"  },
-    { LLM_ARCH_ORION,           "orion"      },
-    { LLM_ARCH_INTERNLM2,       "internlm2"  },
-    { LLM_ARCH_MINICPM,         "minicpm"    },
-    { LLM_ARCH_GEMMA,           "gemma"      },
-    { LLM_ARCH_STARCODER2,      "starcoder2" },
-    { LLM_ARCH_MAMBA,           "mamba"      },
-    { LLM_ARCH_COMMAND_R,       "command-r"  },
-    { LLM_ARCH_UNKNOWN,         "(unknown)"  },
+    { LLM_ARCH_LLAMA,           "llama"        },
+    { LLM_ARCH_FALCON,          "falcon"       },
+    { LLM_ARCH_GROK,            "grok"         },
+    { LLM_ARCH_GPT2,            "gpt2"         },
+    { LLM_ARCH_GPTJ,            "gptj"         },
+    { LLM_ARCH_GPTNEOX,         "gptneox"      },
+    { LLM_ARCH_MPT,             "mpt"          },
+    { LLM_ARCH_BAICHUAN,        "baichuan"     },
+    { LLM_ARCH_STARCODER,       "starcoder"    },
+    { LLM_ARCH_REFACT,          "refact"       },
+    { LLM_ARCH_BERT,            "bert"         },
+    { LLM_ARCH_NOMIC_BERT,      "nomic-bert"   },
+    { LLM_ARCH_JINA_BERT_V2,    "jina-bert-v2" },
+    { LLM_ARCH_BLOOM,           "bloom"        },
+    { LLM_ARCH_STABLELM,        "stablelm"     },
+    { LLM_ARCH_QWEN,            "qwen"         },
+    { LLM_ARCH_QWEN2,           "qwen2"        },
+    { LLM_ARCH_QWEN2MOE,        "qwen2moe"     },
+    { LLM_ARCH_PHI2,            "phi2"         },
+    { LLM_ARCH_PHI3,            "phi3"         },
+    { LLM_ARCH_PLAMO,           "plamo"        },
+    { LLM_ARCH_CODESHELL,       "codeshell"    },
+    { LLM_ARCH_ORION,           "orion"        },
+    { LLM_ARCH_INTERNLM2,       "internlm2"    },
+    { LLM_ARCH_MINICPM,         "minicpm"      },
+    { LLM_ARCH_GEMMA,           "gemma"        },
+    { LLM_ARCH_STARCODER2,      "starcoder2"   },
+    { LLM_ARCH_MAMBA,           "mamba"        },
+    { LLM_ARCH_XVERSE,          "xverse"       },
+    { LLM_ARCH_COMMAND_R,       "command-r"    },
+    { LLM_ARCH_DBRX,            "dbrx"         },
+    { LLM_ARCH_OLMO,            "olmo"         },
+    { LLM_ARCH_ARCTIC,          "arctic"       },
+    { LLM_ARCH_DEEPSEEK2,       "deepseek2"    },
+    { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
 enum llm_kv {
@@ -259,6 +268,7 @@ enum llm_kv {
     LLM_KV_GENERAL_ALIGNMENT,
     LLM_KV_GENERAL_NAME,
     LLM_KV_GENERAL_AUTHOR,
+    LLM_KV_GENERAL_VERSION,
     LLM_KV_GENERAL_URL,
     LLM_KV_GENERAL_DESCRIPTION,
     LLM_KV_GENERAL_LICENSE,
@@ -269,11 +279,15 @@ enum llm_kv {
     LLM_KV_CONTEXT_LENGTH,
     LLM_KV_EMBEDDING_LENGTH,
     LLM_KV_BLOCK_COUNT,
+    LLM_KV_LEADING_DENSE_BLOCK_COUNT,
     LLM_KV_FEED_FORWARD_LENGTH,
+    LLM_KV_EXPERT_FEED_FORWARD_LENGTH,
     LLM_KV_USE_PARALLEL_RESIDUAL,
     LLM_KV_TENSOR_DATA_LAYOUT,
     LLM_KV_EXPERT_COUNT,
     LLM_KV_EXPERT_USED_COUNT,
+    LLM_KV_EXPERT_SHARED_COUNT,
+    LLM_KV_EXPERT_WEIGHTS_SCALE,
     LLM_KV_POOLING_TYPE,
     LLM_KV_LOGIT_SCALE,
 
@@ -286,14 +300,18 @@ enum llm_kv {
     LLM_KV_ATTENTION_LAYERNORM_EPS,
     LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,
     LLM_KV_ATTENTION_CAUSAL,
+    LLM_KV_ATTENTION_Q_LORA_RANK,
+    LLM_KV_ATTENTION_KV_LORA_RANK,
 
     LLM_KV_ROPE_DIMENSION_COUNT,
     LLM_KV_ROPE_FREQ_BASE,
     LLM_KV_ROPE_SCALE_LINEAR,
     LLM_KV_ROPE_SCALING_TYPE,
     LLM_KV_ROPE_SCALING_FACTOR,
+    LLM_KV_ROPE_SCALING_ATTN_FACTOR,
     LLM_KV_ROPE_SCALING_ORIG_CTX_LEN,
     LLM_KV_ROPE_SCALING_FINETUNED,
+    LLM_KV_ROPE_SCALING_YARN_LOG_MUL,
 
     LLM_KV_SPLIT_NO,
     LLM_KV_SPLIT_COUNT,
@@ -305,6 +323,7 @@ enum llm_kv {
     LLM_KV_SSM_TIME_STEP_RANK,
 
     LLM_KV_TOKENIZER_MODEL,
+    LLM_KV_TOKENIZER_PRE,
     LLM_KV_TOKENIZER_LIST,
     LLM_KV_TOKENIZER_TOKEN_TYPE,
     LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT,
@@ -315,11 +334,17 @@ enum llm_kv {
     LLM_KV_TOKENIZER_UNK_ID,
     LLM_KV_TOKENIZER_SEP_ID,
     LLM_KV_TOKENIZER_PAD_ID,
+    LLM_KV_TOKENIZER_CLS_ID,
+    LLM_KV_TOKENIZER_MASK_ID,
     LLM_KV_TOKENIZER_ADD_BOS,
     LLM_KV_TOKENIZER_ADD_EOS,
     LLM_KV_TOKENIZER_ADD_PREFIX,
     LLM_KV_TOKENIZER_HF_JSON,
     LLM_KV_TOKENIZER_RWKV,
+    LLM_KV_TOKENIZER_PREFIX_ID,
+    LLM_KV_TOKENIZER_SUFFIX_ID,
+    LLM_KV_TOKENIZER_MIDDLE_ID,
+    LLM_KV_TOKENIZER_EOT_ID,
 };
 
 static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
@@ -328,23 +353,28 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_GENERAL_ALIGNMENT,             "general.alignment"                     },
     { LLM_KV_GENERAL_NAME,                  "general.name"                          },
     { LLM_KV_GENERAL_AUTHOR,                "general.author"                        },
+    { LLM_KV_GENERAL_VERSION,               "general.version"                       },
     { LLM_KV_GENERAL_URL,                   "general.url"                           },
     { LLM_KV_GENERAL_DESCRIPTION,           "general.description"                   },
     { LLM_KV_GENERAL_LICENSE,               "general.license"                       },
     { LLM_KV_GENERAL_SOURCE_URL,            "general.source.url"                    },
     { LLM_KV_GENERAL_SOURCE_HF_REPO,        "general.source.huggingface.repository" },
 
-    { LLM_KV_VOCAB_SIZE,                    "%s.vocab_size"            },
-    { LLM_KV_CONTEXT_LENGTH,                "%s.context_length"        },
-    { LLM_KV_EMBEDDING_LENGTH,              "%s.embedding_length"      },
-    { LLM_KV_BLOCK_COUNT,                   "%s.block_count"           },
-    { LLM_KV_FEED_FORWARD_LENGTH,           "%s.feed_forward_length"   },
-    { LLM_KV_USE_PARALLEL_RESIDUAL,         "%s.use_parallel_residual" },
-    { LLM_KV_TENSOR_DATA_LAYOUT,            "%s.tensor_data_layout"    },
-    { LLM_KV_EXPERT_COUNT,                  "%s.expert_count"          },
-    { LLM_KV_EXPERT_USED_COUNT,             "%s.expert_used_count"     },
-    { LLM_KV_POOLING_TYPE ,                 "%s.pooling_type"          },
-    { LLM_KV_LOGIT_SCALE,                   "%s.logit_scale"           },
+    { LLM_KV_VOCAB_SIZE,                    "%s.vocab_size"                 },
+    { LLM_KV_CONTEXT_LENGTH,                "%s.context_length"             },
+    { LLM_KV_EMBEDDING_LENGTH,              "%s.embedding_length"           },
+    { LLM_KV_BLOCK_COUNT,                   "%s.block_count"                },
+    { LLM_KV_LEADING_DENSE_BLOCK_COUNT,     "%s.leading_dense_block_count"  },
+    { LLM_KV_FEED_FORWARD_LENGTH,           "%s.feed_forward_length"        },
+    { LLM_KV_EXPERT_FEED_FORWARD_LENGTH,    "%s.expert_feed_forward_length" },
+    { LLM_KV_USE_PARALLEL_RESIDUAL,         "%s.use_parallel_residual"      },
+    { LLM_KV_TENSOR_DATA_LAYOUT,            "%s.tensor_data_layout"         },
+    { LLM_KV_EXPERT_COUNT,                  "%s.expert_count"               },
+    { LLM_KV_EXPERT_USED_COUNT,             "%s.expert_used_count"          },
+    { LLM_KV_EXPERT_SHARED_COUNT,           "%s.expert_shared_count"        },
+    { LLM_KV_EXPERT_WEIGHTS_SCALE,          "%s.expert_weights_scale"       },
+    { LLM_KV_POOLING_TYPE ,                 "%s.pooling_type"               },
+    { LLM_KV_LOGIT_SCALE,                   "%s.logit_scale"                },
 
     { LLM_KV_ATTENTION_HEAD_COUNT,          "%s.attention.head_count"             },
     { LLM_KV_ATTENTION_HEAD_COUNT_KV,       "%s.attention.head_count_kv"          },
@@ -355,14 +385,18 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_LAYERNORM_EPS,       "%s.attention.layer_norm_epsilon"     },
     { LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,   "%s.attention.layer_norm_rms_epsilon" },
     { LLM_KV_ATTENTION_CAUSAL,              "%s.attention.causal"                 },
+    { LLM_KV_ATTENTION_Q_LORA_RANK,         "%s.attention.q_lora_rank"            },
+    { LLM_KV_ATTENTION_KV_LORA_RANK,        "%s.attention.kv_lora_rank"           },
 
     { LLM_KV_ROPE_DIMENSION_COUNT,          "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_FREQ_BASE,                "%s.rope.freq_base"                       },
     { LLM_KV_ROPE_SCALE_LINEAR,             "%s.rope.scale_linear"                    },
     { LLM_KV_ROPE_SCALING_TYPE,             "%s.rope.scaling.type"                    },
     { LLM_KV_ROPE_SCALING_FACTOR,           "%s.rope.scaling.factor"                  },
+    { LLM_KV_ROPE_SCALING_ATTN_FACTOR,      "%s.rope.scaling.attn_factor"             },
     { LLM_KV_ROPE_SCALING_ORIG_CTX_LEN,     "%s.rope.scaling.original_context_length" },
     { LLM_KV_ROPE_SCALING_FINETUNED,        "%s.rope.scaling.finetuned"               },
+    { LLM_KV_ROPE_SCALING_YARN_LOG_MUL,     "%s.rope.scaling.yarn_log_multiplier"     },
 
     { LLM_KV_SPLIT_NO,                      "split.no"            },
     { LLM_KV_SPLIT_COUNT,                   "split.count"         },
@@ -374,6 +408,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SSM_TIME_STEP_RANK,            "%s.ssm.time_step_rank" },
 
     { LLM_KV_TOKENIZER_MODEL,               "tokenizer.ggml.model"              },
+    { LLM_KV_TOKENIZER_PRE,                 "tokenizer.ggml.pre"                },
     { LLM_KV_TOKENIZER_LIST,                "tokenizer.ggml.tokens"             },
     { LLM_KV_TOKENIZER_TOKEN_TYPE,          "tokenizer.ggml.token_type"         },
     { LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT,    "tokenizer.ggml.token_type_count"   },
@@ -384,11 +419,17 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_TOKENIZER_UNK_ID,              "tokenizer.ggml.unknown_token_id"   },
     { LLM_KV_TOKENIZER_SEP_ID,              "tokenizer.ggml.seperator_token_id" },
     { LLM_KV_TOKENIZER_PAD_ID,              "tokenizer.ggml.padding_token_id"   },
+    { LLM_KV_TOKENIZER_CLS_ID,              "tokenizer.ggml.cls_token_id"       },
+    { LLM_KV_TOKENIZER_MASK_ID,             "tokenizer.ggml.mask_token_id"      },
     { LLM_KV_TOKENIZER_ADD_BOS,             "tokenizer.ggml.add_bos_token"      },
     { LLM_KV_TOKENIZER_ADD_EOS,             "tokenizer.ggml.add_eos_token"      },
     { LLM_KV_TOKENIZER_ADD_PREFIX,          "tokenizer.ggml.add_space_prefix"   },
     { LLM_KV_TOKENIZER_HF_JSON,             "tokenizer.huggingface.json"        },
     { LLM_KV_TOKENIZER_RWKV,                "tokenizer.rwkv.world"              },
+    { LLM_KV_TOKENIZER_PREFIX_ID,           "tokenizer.ggml.prefix_token_id"    },
+    { LLM_KV_TOKENIZER_SUFFIX_ID,           "tokenizer.ggml.suffix_token_id"    },
+    { LLM_KV_TOKENIZER_MIDDLE_ID,           "tokenizer.ggml.middle_token_id"    },
+    { LLM_KV_TOKENIZER_EOT_ID,              "tokenizer.ggml.eot_token_id"       },
 };
 
 struct LLM_KV {
@@ -409,6 +450,8 @@ enum llm_tensor {
     LLM_TENSOR_OUTPUT,
     LLM_TENSOR_OUTPUT_NORM,
     LLM_TENSOR_ROPE_FREQS,
+    LLM_TENSOR_ROPE_FACTORS_LONG,
+    LLM_TENSOR_ROPE_FACTORS_SHORT,
     LLM_TENSOR_ATTN_Q,
     LLM_TENSOR_ATTN_K,
     LLM_TENSOR_ATTN_V,
@@ -419,14 +462,22 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_OUT_NORM,
     LLM_TENSOR_ATTN_ROT_EMBD,
     LLM_TENSOR_FFN_GATE_INP,
+    LLM_TENSOR_FFN_GATE_INP_SHEXP,
     LLM_TENSOR_FFN_NORM,
     LLM_TENSOR_FFN_GATE,
     LLM_TENSOR_FFN_DOWN,
     LLM_TENSOR_FFN_UP,
     LLM_TENSOR_FFN_ACT,
-    LLM_TENSOR_FFN_DOWN_EXP,
+    LLM_TENSOR_FFN_DOWN_EXP,  // split experts for backward compatibility
     LLM_TENSOR_FFN_GATE_EXP,
     LLM_TENSOR_FFN_UP_EXP,
+    LLM_TENSOR_FFN_NORM_EXPS,
+    LLM_TENSOR_FFN_DOWN_EXPS, // merged experts
+    LLM_TENSOR_FFN_GATE_EXPS,
+    LLM_TENSOR_FFN_UP_EXPS,
+    LLM_TENSOR_FFN_DOWN_SHEXP,
+    LLM_TENSOR_FFN_GATE_SHEXP,
+    LLM_TENSOR_FFN_UP_SHEXP,
     LLM_TENSOR_ATTN_Q_NORM,
     LLM_TENSOR_ATTN_K_NORM,
     LLM_TENSOR_LAYER_OUT_NORM,
@@ -437,6 +488,12 @@ enum llm_tensor {
     LLM_TENSOR_SSM_A,
     LLM_TENSOR_SSM_D,
     LLM_TENSOR_SSM_OUT,
+    LLM_TENSOR_ATTN_Q_A,
+    LLM_TENSOR_ATTN_Q_B,
+    LLM_TENSOR_ATTN_KV_A_MQA,
+    LLM_TENSOR_ATTN_KV_B,
+    LLM_TENSOR_ATTN_Q_A_NORM,
+    LLM_TENSOR_ATTN_KV_A_NORM,
 };
 
 static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NAMES = {
@@ -461,6 +518,9 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_GATE_EXP,    "blk.%d.ffn_gate.%d" },
             { LLM_TENSOR_FFN_DOWN_EXP,    "blk.%d.ffn_down.%d" },
             { LLM_TENSOR_FFN_UP_EXP,      "blk.%d.ffn_up.%d" },
+            { LLM_TENSOR_FFN_GATE_EXPS,   "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,   "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,     "blk.%d.ffn_up_exps" },
         },
     },
     {
@@ -514,6 +574,9 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_GATE_EXP,    "blk.%d.ffn_gate.%d" },
             { LLM_TENSOR_FFN_DOWN_EXP,    "blk.%d.ffn_down.%d" },
             { LLM_TENSOR_FFN_UP_EXP,      "blk.%d.ffn_up.%d" },
+            { LLM_TENSOR_FFN_GATE_EXPS,   "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,   "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,     "blk.%d.ffn_up_exps" },
             { LLM_TENSOR_LAYER_OUT_NORM,  "blk.%d.layer_output_norm" },
             { LLM_TENSOR_ATTN_OUT_NORM,   "blk.%d.attn_output_norm" },
         },
@@ -554,23 +617,6 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
-        LLM_ARCH_PERSIMMON,
-        {
-            { LLM_TENSOR_TOKEN_EMBD,      "token_embd"},
-            { LLM_TENSOR_OUTPUT_NORM,     "output_norm"},
-            { LLM_TENSOR_OUTPUT,          "output"},
-            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm"},
-            { LLM_TENSOR_ATTN_QKV,        "blk.%d.attn_qkv"},
-            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output"},
-            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm"},
-            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm"},
-            { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm"},
-            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down"},
-            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up"},
-            { LLM_TENSOR_ATTN_ROT_EMBD,   "blk.%d.attn_rot_embd"},
-        },
-    },
-    {
         LLM_ARCH_MPT,
         {
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
@@ -583,6 +629,9 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
             { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
             { LLM_TENSOR_FFN_ACT,         "blk.%d.ffn.act" },
+            { LLM_TENSOR_POS_EMBD,        "position_embd" },
+            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm"},
+            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm"},
         },
     },
     {
@@ -650,6 +699,26 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        LLM_ARCH_JINA_BERT_V2,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_TOKEN_EMBD_NORM, "token_embd_norm" },
+            { LLM_TENSOR_TOKEN_TYPES,     "token_types" },
+            { LLM_TENSOR_ATTN_NORM_2,     "blk.%d.attn_norm_2" },
+            { LLM_TENSOR_ATTN_OUT_NORM,   "blk.%d.attn_output_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_LAYER_OUT_NORM,  "blk.%d.layer_output_norm" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+        },
+    },
+    {
         LLM_ARCH_BLOOM,
         {
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
@@ -680,6 +749,8 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
             { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
             { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
         },
     },
     {
@@ -716,6 +787,28 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        LLM_ARCH_QWEN2MOE,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,         "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,        "output_norm" },
+            { LLM_TENSOR_OUTPUT,             "output" },
+            { LLM_TENSOR_ATTN_NORM,          "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,             "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,             "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,             "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,           "blk.%d.attn_output" },
+            { LLM_TENSOR_FFN_NORM,           "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE_INP,       "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_GATE_EXPS,      "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,      "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,        "blk.%d.ffn_up_exps" },
+            { LLM_TENSOR_FFN_GATE_INP_SHEXP, "blk.%d.ffn_gate_inp_shexp" },
+            { LLM_TENSOR_FFN_GATE_SHEXP,     "blk.%d.ffn_gate_shexp" },
+            { LLM_TENSOR_FFN_DOWN_SHEXP,     "blk.%d.ffn_down_shexp" },
+            { LLM_TENSOR_FFN_UP_SHEXP,       "blk.%d.ffn_up_shexp" },
+        },
+    },
+    {
         LLM_ARCH_PHI2,
         {
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
@@ -729,6 +822,25 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
             { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
             { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+        },
+    },
+    {
+        LLM_ARCH_PHI3,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,         "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,        "output_norm" },
+            { LLM_TENSOR_OUTPUT,             "output" },
+            { LLM_TENSOR_ROPE_FACTORS_LONG,  "rope_factors_long" },
+            { LLM_TENSOR_ROPE_FACTORS_SHORT, "rope_factors_short" },
+            { LLM_TENSOR_ATTN_NORM,          "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_QKV,           "blk.%d.attn_qkv" },
+            { LLM_TENSOR_ATTN_Q,             "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,             "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,             "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,           "blk.%d.attn_output" },
+            { LLM_TENSOR_FFN_NORM,           "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_DOWN,           "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,             "blk.%d.ffn_up" },
         },
     },
     {
@@ -879,6 +991,25 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        LLM_ARCH_XVERSE,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ROPE_FREQS,      "rope_freqs" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_ROT_EMBD,   "blk.%d.attn_rot_embd" },
+            { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+        },
+    },
+    {
         LLM_ARCH_COMMAND_R,
         {
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
@@ -891,6 +1022,89 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
             { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
             { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
+        },
+    },
+    {
+        LLM_ARCH_DBRX,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ATTN_QKV,        "blk.%d.attn_qkv" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_OUT_NORM,   "blk.%d.attn_output_norm" },
+            { LLM_TENSOR_FFN_GATE_INP,    "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_GATE_EXPS,   "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,   "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,     "blk.%d.ffn_up_exps" },
+        },
+    },
+    {
+        LLM_ARCH_OLMO,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+        },
+    },
+    {
+        LLM_ARCH_ARCTIC,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_FFN_GATE_INP,    "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+            { LLM_TENSOR_FFN_NORM_EXPS,   "blk.%d.ffn_norm_exps" },
+            { LLM_TENSOR_FFN_GATE_EXPS,   "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,   "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,     "blk.%d.ffn_up_exps" },
+        },
+    },
+    {
+        LLM_ARCH_DEEPSEEK2,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,         "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,        "output_norm" },
+            { LLM_TENSOR_OUTPUT,             "output" },
+            { LLM_TENSOR_ATTN_NORM,          "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q_A_NORM,      "blk.%d.attn_q_a_norm" },
+            { LLM_TENSOR_ATTN_KV_A_NORM,     "blk.%d.attn_kv_a_norm" },
+            { LLM_TENSOR_ATTN_Q,             "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_Q_A,           "blk.%d.attn_q_a" },
+            { LLM_TENSOR_ATTN_Q_B,           "blk.%d.attn_q_b" },
+            { LLM_TENSOR_ATTN_KV_A_MQA,      "blk.%d.attn_kv_a_mqa" },
+            { LLM_TENSOR_ATTN_KV_B,          "blk.%d.attn_kv_b" },
+            { LLM_TENSOR_ATTN_OUT,           "blk.%d.attn_output" },
+            { LLM_TENSOR_FFN_NORM,           "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE,           "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_UP,             "blk.%d.ffn_up" },
+            { LLM_TENSOR_FFN_DOWN,           "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_GATE_INP,       "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_GATE_EXPS,      "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,      "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,        "blk.%d.ffn_up_exps" },
+            { LLM_TENSOR_FFN_GATE_INP_SHEXP, "blk.%d.ffn_gate_inp_shexp" },
+            { LLM_TENSOR_FFN_GATE_SHEXP,     "blk.%d.ffn_gate_shexp" },
+            { LLM_TENSOR_FFN_DOWN_SHEXP,     "blk.%d.ffn_down_shexp" },
+            { LLM_TENSOR_FFN_UP_SHEXP,       "blk.%d.ffn_up_shexp" },
         },
     },
     {
@@ -1487,12 +1701,13 @@ struct llama_mlock {
 };
 using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
-static std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token) {
+// NOTE: avoid ever using this except for building the token_to_piece caches
+static std::string llama_token_to_piece(const struct llama_model * model, llama_token token, bool special) {
     std::vector<char> result(8, 0);
-    const int n_tokens = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size());
+    const int n_tokens = llama_token_to_piece(model, token, result.data(), result.size(), special);
     if (n_tokens < 0) {
         result.resize(-n_tokens);
-        int check = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size());
+        int check = llama_token_to_piece(model, token, result.data(), result.size(), special);
         GGML_ASSERT(check == -n_tokens);
     }
     else {
@@ -1505,7 +1720,7 @@ static std::string llama_token_to_piece(const struct llama_context * ctx, llama_
 static ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer) {
     ggml_backend_buffer_type_t buft = nullptr;
 
-#if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUDA)
     // host buffers should only be used when data is expected to be copied to/from the GPU
     if (host_buffer) {
         buft = ggml_backend_cuda_host_buffer_type();
@@ -1530,91 +1745,6 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer
     GGML_UNUSED(host_buffer);
 }
 
-static ggml_backend_buffer_type_t llama_default_buffer_type_offload(int gpu) {
-    ggml_backend_buffer_type_t buft = nullptr;
-
-#ifdef GGML_USE_METAL
-    buft = ggml_backend_metal_buffer_type();
-#elif defined(GGML_USE_CUBLAS)
-    buft = ggml_backend_cuda_buffer_type(gpu);
-#elif defined(GGML_USE_VULKAN)
-    buft = ggml_backend_vk_buffer_type(gpu);
-#elif defined(GGML_USE_SYCL)
-    buft = ggml_backend_sycl_buffer_type(gpu);
-#elif defined(GGML_USE_CLBLAST)
-    buft = ggml_backend_opencl_buffer_type();
-#elif defined(GGML_USE_KOMPUTE)
-    buft = ggml_backend_kompute_buffer_type(gpu);
-    if (buft == nullptr) {
-        LLAMA_LOG_WARN("%s: cannot use GPU %d, check `vulkaninfo --summary`\n", __func__, gpu);
-    }
-#endif
-
-    if (buft == nullptr) {
-        buft = llama_default_buffer_type_cpu(true);
-    }
-    return buft;
-
-    GGML_UNUSED(gpu);
-}
-
-static ggml_backend_buffer_type_t llama_default_buffer_type_split(int fallback_gpu, const float * tensor_split) {
-    ggml_backend_buffer_type_t buft = nullptr;
-
-#ifdef GGML_USE_CUBLAS
-    if (ggml_backend_cuda_get_device_count() > 1) {
-        buft = ggml_backend_cuda_split_buffer_type(tensor_split);
-    }
-#endif
-
-#ifdef GGML_USE_SYCL
-    if (ggml_backend_sycl_get_device_count() > 1) {
-        buft = ggml_backend_sycl_split_buffer_type(tensor_split);
-    }
-#endif
-
-    if (buft == nullptr) {
-        buft = llama_default_buffer_type_offload(fallback_gpu);
-    }
-    return buft;
-
-    GGML_UNUSED(tensor_split);
-}
-
-static size_t llama_get_device_count() {
-#if defined(GGML_USE_CUBLAS)
-    return ggml_backend_cuda_get_device_count();
-#elif defined(GGML_USE_SYCL)
-    return ggml_backend_sycl_get_device_count();
-#elif defined(GGML_USE_VULKAN)
-    return ggml_backend_vk_get_device_count();
-#else
-    return 1;
-#endif
-}
-
-static size_t llama_get_device_memory(int device) {
-#if defined(GGML_USE_CUBLAS)
-    size_t total;
-    size_t free;
-    ggml_backend_cuda_get_device_memory(device, &total, &free);
-    return free;
-#elif defined(GGML_USE_SYCL)
-    size_t total;
-    size_t free;
-    ggml_backend_sycl_get_device_memory(device, &total, &free);
-    return free;
-#elif defined(GGML_USE_VULKAN)
-    size_t total;
-    size_t free;
-    ggml_backend_vk_get_device_memory(device, &total, &free);
-    return free;
-#else
-    return 1;
-    GGML_UNUSED(device);
-#endif
-}
-
 //
 // globals
 //
@@ -1623,6 +1753,8 @@ struct llama_state {
     llama_state() {
 #ifdef GGML_USE_METAL
         ggml_backend_metal_log_set_callback(log_callback, log_callback_user_data);
+#elif defined(GGML_USE_CUDA)
+        ggml_backend_cuda_log_set_callback(log_callback, log_callback_user_data);
 #endif
     }
 
@@ -1636,22 +1768,31 @@ static llama_state g_state;
 // available llama models
 enum e_model {
     MODEL_UNKNOWN,
+    MODEL_14M,
     MODEL_17M,
     MODEL_22M,
     MODEL_33M,
+    MODEL_70M,
     MODEL_109M,
     MODEL_137M,
+    MODEL_160M,
     MODEL_335M,
+    MODEL_410M,
     MODEL_0_5B,
     MODEL_1B,
+    MODEL_1_4B,
     MODEL_2B,
+    MODEL_2_8B,
     MODEL_3B,
     MODEL_4B,
+    MODEL_6_9B,
     MODEL_7B,
     MODEL_8B,
+    MODEL_12B,
     MODEL_13B,
     MODEL_14B,
     MODEL_15B,
+    MODEL_16B,
     MODEL_20B,
     MODEL_30B,
     MODEL_34B,
@@ -1659,11 +1800,17 @@ enum e_model {
     MODEL_40B,
     MODEL_65B,
     MODEL_70B,
+    MODEL_236B,
     MODEL_314B,
     MODEL_SMALL,
     MODEL_MEDIUM,
     MODEL_LARGE,
     MODEL_XL,
+    MODEL_A2_7B,
+    MODEL_8x7B,
+    MODEL_8x22B,
+    MODEL_16x12B,
+    MODEL_10B_128x3_66B,
 };
 
 static const size_t kiB = 1024;
@@ -1673,6 +1820,7 @@ static const size_t GiB = 1024*MiB;
 struct llama_hparams {
     bool vocab_only;
     bool rope_finetuned;
+    bool use_par_res;
 
     uint32_t n_vocab;
     uint32_t n_ctx_train; // context size the model was trained on
@@ -1688,12 +1836,21 @@ struct llama_hparams {
     uint32_t n_expert_used = 0;
     uint32_t n_vocab_type = 0; // for BERT-style token types
 
+    uint32_t n_layer_dense_lead = 0;
+    uint32_t n_lora_q = 0;
+    uint32_t n_lora_kv = 0;
+    uint32_t n_ff_exp = 0;
+    uint32_t n_expert_shared = 0;
+    float    expert_weights_scale = 0.0;
+
     float f_norm_eps;
     float f_norm_rms_eps;
 
+    float    rope_attn_factor = 1.0f;
     float    rope_freq_base_train;
     float    rope_freq_scale_train;
-    uint32_t n_yarn_orig_ctx;
+    uint32_t n_ctx_orig_yarn;
+    float    rope_yarn_log_mul;
 
     // for State Space Models
     uint32_t ssm_d_conv  = 0;
@@ -1706,7 +1863,7 @@ struct llama_hparams {
     float f_logit_scale    = 0.0f;
 
     bool causal_attn = true;
-    bool need_kq_pos = false;
+    bool use_alibi   = false;
 
     enum llama_pooling_type      pooling_type            = LLAMA_POOLING_TYPE_NONE;
     enum llama_rope_type         rope_type               = LLAMA_ROPE_TYPE_NONE;
@@ -1727,8 +1884,14 @@ struct llama_hparams {
         if (this->n_expert      != other.n_expert)      return true;
         if (this->n_expert_used != other.n_expert_used) return true;
 
+        if (this->n_layer_dense_lead != other.n_layer_dense_lead) return true;
+        if (this->n_lora_q           != other.n_lora_q)           return true;
+        if (this->n_lora_kv          != other.n_lora_kv)          return true;
+        if (this->n_ff_exp           != other.n_ff_exp)           return true;
+        if (this->n_expert_shared    != other.n_expert_shared)    return true;
+
         if (this->rope_finetuned  != other.rope_finetuned)  return true;
-        if (this->n_yarn_orig_ctx != other.n_yarn_orig_ctx) return true;
+        if (this->n_ctx_orig_yarn != other.n_ctx_orig_yarn) return true;
 
         if (this->ssm_d_conv  != other.ssm_d_conv)  return true;
         if (this->ssm_d_inner != other.ssm_d_inner) return true;
@@ -1739,8 +1902,11 @@ struct llama_hparams {
 
         if (!is_float_close(this->f_norm_eps,            other.f_norm_eps,            EPSILON)) return true;
         if (!is_float_close(this->f_norm_rms_eps,        other.f_norm_rms_eps,        EPSILON)) return true;
+        if (!is_float_close(this->rope_attn_factor,      other.rope_attn_factor,      EPSILON)) return true;
         if (!is_float_close(this->rope_freq_base_train,  other.rope_freq_base_train,  EPSILON)) return true;
         if (!is_float_close(this->rope_freq_scale_train, other.rope_freq_scale_train, EPSILON)) return true;
+        if (!is_float_close(this->expert_weights_scale,  other.expert_weights_scale,  EPSILON)) return true;
+        if (!is_float_close(this->rope_yarn_log_mul,     other.rope_yarn_log_mul,     EPSILON)) return true;
 
         return false;
     }
@@ -1777,13 +1943,14 @@ struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_batch;
     uint32_t n_ubatch;
+    uint32_t n_seq_max;
     uint32_t n_threads;       // number of threads to use for generation
     uint32_t n_threads_batch; // number of threads to use for batch processing
 
     float rope_freq_base;
     float rope_freq_scale;
 
-    uint32_t n_yarn_orig_ctx;
+    uint32_t n_ctx_orig_yarn;
     // These hyperparameters are not exposed in GGUF, because all
     // existing YaRN models use the same values for them.
     float yarn_ext_factor;
@@ -1795,6 +1962,7 @@ struct llama_cparams {
     bool embeddings;
     bool causal_attn;
     bool offload_kqv;
+    bool flash_attn;
 
     enum llama_pooling_type pooling_type;
 
@@ -1814,6 +1982,8 @@ struct llama_layer {
     struct ggml_tensor * attn_k_norm_b;
     struct ggml_tensor * attn_out_norm;
     struct ggml_tensor * attn_out_norm_b;
+    struct ggml_tensor * attn_q_a_norm;
+    struct ggml_tensor * attn_kv_a_norm;
 
     // attention
     struct ggml_tensor * wq;
@@ -1821,6 +1991,10 @@ struct llama_layer {
     struct ggml_tensor * wv;
     struct ggml_tensor * wo;
     struct ggml_tensor * wqkv;
+    struct ggml_tensor * wq_a;
+    struct ggml_tensor * wq_b;
+    struct ggml_tensor * wkv_a_mqa;
+    struct ggml_tensor * wkv_b;
 
     // attention bias
     struct ggml_tensor * bq;
@@ -1834,6 +2008,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_norm_b;
     struct ggml_tensor * layer_out_norm;
     struct ggml_tensor * layer_out_norm_b;
+    struct ggml_tensor * ffn_norm_exps;
 
     // ff
     struct ggml_tensor * ffn_gate; // w1
@@ -1842,13 +2017,20 @@ struct llama_layer {
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp;
-    struct ggml_tensor * ffn_gate_exp[LLAMA_MAX_EXPERTS];
-    struct ggml_tensor * ffn_down_exp[LLAMA_MAX_EXPERTS];
-    struct ggml_tensor * ffn_up_exp  [LLAMA_MAX_EXPERTS];
+    struct ggml_tensor * ffn_gate_exps;
+    struct ggml_tensor * ffn_down_exps;
+    struct ggml_tensor * ffn_up_exps ;
+
+    // ff shared expert (shexp)
+    struct ggml_tensor * ffn_gate_inp_shexp;
+    struct ggml_tensor * ffn_gate_shexp;
+    struct ggml_tensor * ffn_down_shexp;
+    struct ggml_tensor * ffn_up_shexp;
 
     // ff bias
-    struct ggml_tensor * ffn_down_b; // b2
-    struct ggml_tensor * ffn_up_b;   // b3
+    struct ggml_tensor * ffn_gate_b = nullptr;
+    struct ggml_tensor * ffn_down_b = nullptr; // b2
+    struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act;
 
     // mamba proj
@@ -1865,6 +2047,10 @@ struct llama_layer {
     // mamba bias
     struct ggml_tensor * ssm_conv1d_b;
     struct ggml_tensor * ssm_dt_b;
+
+    // long rope factors
+    struct ggml_tensor * rope_long  = nullptr;
+    struct ggml_tensor * rope_short = nullptr;
 };
 
 struct llama_kv_cell {
@@ -1892,8 +2078,8 @@ struct llama_kv_cache {
     bool has_shift = false;
     bool do_defrag = false;
     bool do_copy   = false;
-    // with recurrent state models, a cell can hold the state for more than one past token
-    bool recurrent = false;
+    bool recurrent = false; // with recurrent state models, a cell can hold the state for more than one past token
+    bool v_trans   = true;  // the value tensor is transposed
 
     // Note: The value of head isn't only used to optimize searching
     // for a free KV slot. llama_decode_internal also uses it, so it
@@ -1962,38 +2148,42 @@ struct llama_control_vector {
 struct llama_vocab {
     using id    = int32_t;
     using token = std::string;
-    using ttype = llama_token_type;
+    using tattr = llama_token_attr;
 
     struct token_data {
         token text;
         float score;
-        ttype type;
+        tattr attr;
     };
 
-    enum llama_vocab_type type = LLAMA_VOCAB_TYPE_SPM;
+    enum llama_vocab_type     type     = LLAMA_VOCAB_TYPE_SPM;
+    enum llama_vocab_pre_type type_pre = LLAMA_VOCAB_PRE_TYPE_DEFAULT;
 
     std::unordered_map<token, id> token_to_id;
     std::vector<token_data>       id_to_token;
 
-    std::unordered_map<token, id> special_tokens_cache;
+    std::vector<id>    cache_special_tokens;
+    std::vector<token> cache_token_to_piece; // llama_token_to_piece(special = true);
 
     std::map<std::pair<std::string, std::string>, int> bpe_ranks;
 
     // default LLaMA special tokens
-    id special_bos_id = 1;
-    id special_eos_id = 2;
-    id special_unk_id = 0;
-    id special_sep_id = -1;
-    id special_pad_id = -1;
+    id special_bos_id  = 1;
+    id special_eos_id  = 2;
+    id special_unk_id  = 0;
+    id special_sep_id  = -1;
+    id special_pad_id  = -1;
+    id special_cls_id  = -1;
+    id special_mask_id = -1;
 
     int special_add_bos = -1; // -1 unknown, 1 add, 0 don't add.
     int special_add_eos = -1; // -1 unknown, 1 add, 0 don't add.
 
     id linefeed_id       = 13;
-    id special_prefix_id = 32007;
-    id special_middle_id = 32009;
-    id special_suffix_id = 32008;
-    id special_eot_id    = 32010;
+    id special_prefix_id = -1;
+    id special_suffix_id = -1;
+    id special_middle_id = -1;
+    id special_eot_id    = -1; // TODO: move above after "eos_id", and here add "file separator" token
 
     bool add_space_prefix = true;
 
@@ -2039,6 +2229,8 @@ struct llama_model {
     int main_gpu;
     int n_gpu_layers;
 
+    std::vector<std::string> rpc_servers;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
@@ -2080,7 +2272,7 @@ struct llama_model {
             ggml_free(ctx);
         }
         for (ggml_backend_buffer_t buf : bufs) {
-#ifdef GGML_USE_CUBLAS
+#ifdef GGML_USE_CUDA
             if (ggml_backend_buffer_get_type(buf) == ggml_backend_cpu_buffer_type()) {
                 ggml_backend_cuda_unregister_host_buffer(ggml_backend_buffer_get_base(buf));
             }
@@ -2098,10 +2290,6 @@ struct llama_context {
         for (ggml_backend_t backend : backends) {
             ggml_backend_free(backend);
         }
-
-#ifdef GGML_USE_VULKAN
-        ggml_vk_free_cpu_assist();
-#endif
 
         ggml_backend_buffer_free(buf_output);
     }
@@ -2139,20 +2327,20 @@ struct llama_context {
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_t buf_output = nullptr;
 
-    // decode output (2-dimensional array: [n_tokens][n_vocab])
-    size_t logits_size = 0;
-    float * logits = nullptr;
+    // decode output (2-dimensional array: [n_outputs][n_vocab])
+    size_t  logits_size = 0; // capacity (of floats) for logits
+    float * logits      = nullptr;
 
-#ifndef NDEBUG
-    // guard against access to unset logits
-    std::vector<bool>  logits_valid;
-#endif
+    std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+    size_t  output_size = 0; // capacity (of tokens positions) for the output buffers
+    int32_t n_outputs   = 0; // number of actually-used outputs in the current ubatch or last logical batch
+
     bool logits_all = false;
 
-    // embeddings output (2-dimensional array: [n_tokens][n_embd])
+    // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
-    size_t embd_size = 0;
-    float * embd = nullptr;
+    size_t  embd_size = 0; // capacity (of floats) for embeddings
+    float * embd      = nullptr;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
@@ -2169,22 +2357,125 @@ struct llama_context {
     struct ggml_tensor * inp_tokens;    // I32 [n_batch]
     struct ggml_tensor * inp_embd;      // F32 [n_embd, n_batch]
     struct ggml_tensor * inp_pos;       // I32 [n_batch]
+    struct ggml_tensor * inp_out_ids;   // I32 [n_outputs]
     struct ggml_tensor * inp_KQ_mask;   // F32 [kv_size, n_batch]
-    struct ggml_tensor * inp_KQ_pos;    // F32 [kv_size]
     struct ggml_tensor * inp_K_shift;   // I32 [kv_size]
     struct ggml_tensor * inp_mean;      // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls;       // I32 [n_batch]
     struct ggml_tensor * inp_s_copy;    // I32 [kv_size]
-    struct ggml_tensor * inp_s_mask;    // F32 [1, kv_size]
-    struct ggml_tensor * inp_s_seq;     // I32 [kv_size, n_batch]
+    struct ggml_tensor * inp_s_mask;    // F32 [1, n_kv]
+    struct ggml_tensor * inp_s_seq;     // I32 [n_kv, n_batch]
 
     // control vectors
     struct llama_control_vector cvec;
-
-#ifdef GGML_USE_MPI
-    ggml_mpi_context * ctx_mpi = NULL;
-#endif
 };
+
+static size_t llama_get_device_count(const llama_model & model) {
+    size_t count = 1;
+#if defined(GGML_USE_CUDA)
+    count = ggml_backend_cuda_get_device_count();
+#elif defined(GGML_USE_SYCL)
+    count = ggml_backend_sycl_get_device_count();
+#elif defined(GGML_USE_VULKAN)
+    count = ggml_backend_vk_get_device_count();
+#endif
+#if defined(GGML_USE_RPC)
+    count += model.rpc_servers.size();
+#endif
+    return count;
+    GGML_UNUSED(model);
+}
+
+static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_model & model, int gpu) {
+    ggml_backend_buffer_type_t buft = nullptr;
+
+#if defined(GGML_USE_RPC)
+    int dev_count = (int)llama_get_device_count(model);
+    int rpc_count = (int)model.rpc_servers.size();
+    if (gpu >= dev_count - rpc_count) {
+        const char * endpoint = model.rpc_servers[gpu - dev_count + rpc_count].c_str();
+        return ggml_backend_rpc_buffer_type(endpoint);
+    }
+#endif
+#if defined(GGML_USE_METAL)
+    buft = ggml_backend_metal_buffer_type();
+#elif defined(GGML_USE_CUDA)
+    buft = ggml_backend_cuda_buffer_type(gpu);
+#elif defined(GGML_USE_VULKAN)
+    buft = ggml_backend_vk_buffer_type(gpu);
+#elif defined(GGML_USE_SYCL)
+    buft = ggml_backend_sycl_buffer_type(gpu);
+#elif defined(GGML_USE_KOMPUTE)
+    buft = ggml_backend_kompute_buffer_type(gpu);
+    if (buft == nullptr) {
+        LLAMA_LOG_WARN("%s: cannot use GPU %d, check `vulkaninfo --summary`\n", __func__, gpu);
+    }
+#endif
+
+    if (buft == nullptr) {
+        buft = llama_default_buffer_type_cpu(true);
+    }
+    return buft;
+    GGML_UNUSED(model);
+    GGML_UNUSED(gpu);
+}
+
+static ggml_backend_buffer_type_t llama_default_buffer_type_split(const llama_model & model, int fallback_gpu, const float * tensor_split) {
+    ggml_backend_buffer_type_t buft = nullptr;
+
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() > 1) {
+        buft = ggml_backend_cuda_split_buffer_type(tensor_split);
+    }
+#endif
+
+#ifdef GGML_USE_SYCL
+    if (ggml_backend_sycl_get_device_count() > 1) {
+        buft = ggml_backend_sycl_split_buffer_type(tensor_split);
+    }
+#endif
+
+    if (buft == nullptr) {
+        buft = llama_default_buffer_type_offload(model, fallback_gpu);
+    }
+    return buft;
+
+    GGML_UNUSED(tensor_split);
+}
+
+static size_t llama_get_device_memory(const llama_model & model, int device) {
+#if defined(GGML_USE_RPC)
+    int dev_count = (int)llama_get_device_count(model);
+    int rpc_count = (int)model.rpc_servers.size();
+    if (device >= dev_count - rpc_count) {
+        size_t total;
+        size_t free;
+        const char * endpoint = model.rpc_servers[device - dev_count + rpc_count].c_str();
+        ggml_backend_rpc_get_device_memory(endpoint, &free, &total);
+        return free;
+    }
+#endif
+#if defined(GGML_USE_CUDA)
+    size_t total;
+    size_t free;
+    ggml_backend_cuda_get_device_memory(device, &free, &total);
+    return free;
+#elif defined(GGML_USE_SYCL)
+    size_t total;
+    size_t free;
+    ggml_backend_sycl_get_device_memory(device, &free, &total);
+    return free;
+#elif defined(GGML_USE_VULKAN)
+    size_t total;
+    size_t free;
+    ggml_backend_vk_get_device_memory(device, &free, &total);
+    return free;
+#else
+    return 1;
+#endif
+    GGML_UNUSED(model);
+    GGML_UNUSED(device);
+}
 
 //
 // kv cache helpers
@@ -2192,11 +2483,14 @@ struct llama_context {
 
 static bool llama_kv_cache_init(
              struct llama_kv_cache & cache,
-                 const llama_model & model,
+               const llama_context * ctx,
                          ggml_type   type_k,
                          ggml_type   type_v,
                           uint32_t   kv_size,
                               bool   offload) {
+    const llama_model & model = ctx->model;
+    const llama_cparams & cparams = ctx->cparams;
+
     const struct llama_hparams & hparams = model.hparams;
 
     const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa() + hparams.n_embd_k_s();
@@ -2207,8 +2501,9 @@ static bool llama_kv_cache_init(
 
     // TODO: find a nicer way to add other recurrent model architectures
     cache.recurrent = model.arch == LLM_ARCH_MAMBA;
+    cache.v_trans   = !cparams.flash_attn;
 
-    // TODO: support mixed reccurent Transformer architectues
+    // TODO: support mixed recurrent Transformer architectures
     // NOTE: (!a || b) is a logical implication (a -> b)
     GGML_ASSERT(!cache.recurrent || n_embd_k_gqa == hparams.n_embd_k_s());
     GGML_ASSERT(!cache.recurrent || n_embd_v_gqa == hparams.n_embd_v_s());
@@ -2231,10 +2526,6 @@ static bool llama_kv_cache_init(
             cache.cells[i].src = i;
         }
     }
-
-#ifdef GGML_USE_CLBLAST
-    offload = false;
-#endif
 
     // count used buffer types
     std::map<ggml_backend_buffer_type_t, int> buft_layer_count;
@@ -2301,7 +2592,6 @@ static bool llama_kv_cache_init(
 static bool llama_kv_cache_find_slot(
            struct llama_kv_cache & cache,
         const struct llama_batch & batch) {
-    const uint32_t n_ctx    = cache.size;
     const uint32_t n_tokens = batch.n_tokens;
 
     if (cache.recurrent) {
@@ -2352,16 +2642,16 @@ static bool llama_kv_cache_find_slot(
     }
     // otherwise, one cell per token.
 
-    if (n_tokens > n_ctx) {
-        LLAMA_LOG_ERROR("%s: n_tokens=%d > n_ctx=%d\n", __func__, n_tokens, n_ctx);
+    if (n_tokens > cache.size) {
+        LLAMA_LOG_ERROR("%s: n_tokens=%d > cache.size=%d\n", __func__, n_tokens, cache.size);
         return false;
     }
 
     uint32_t n_tested = 0;
 
     while (true) {
-        if (cache.head + n_tokens > n_ctx) {
-            n_tested += n_ctx - cache.head;
+        if (cache.head + n_tokens > cache.size) {
+            n_tested += cache.size - cache.head;
             cache.head = 0;
             continue;
         }
@@ -2380,7 +2670,7 @@ static bool llama_kv_cache_find_slot(
             break;
         }
 
-        if (n_tested >= n_ctx) {
+        if (n_tested >= cache.size) {
             //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
             return false;
         }
@@ -2419,6 +2709,10 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
     cache.head = 0;
     cache.used = 0;
+
+    for (auto & buf : cache.bufs) {
+        ggml_backend_buffer_clear(buf, 0);
+    }
 }
 
 static bool llama_kv_cache_seq_rm(
@@ -2630,6 +2924,11 @@ static void llama_kv_cache_defrag(struct llama_kv_cache & cache) {
     cache.do_defrag = true;
 }
 
+static uint32_t llama_kv_cache_get_padding(const struct llama_cparams & cparams) {
+    // the FA kernels require padding to avoid extra runtime boundary checks
+    return cparams.flash_attn ? 256u : 32u;
+}
+
 //
 // model loading and saving
 //
@@ -2739,6 +3038,7 @@ namespace GGUFMeta {
                 case LLAMA_KV_OVERRIDE_TYPE_BOOL:  return "bool";
                 case LLAMA_KV_OVERRIDE_TYPE_INT:   return "int";
                 case LLAMA_KV_OVERRIDE_TYPE_FLOAT: return "float";
+                case LLAMA_KV_OVERRIDE_TYPE_STR:   return "str";
             }
             return "unknown";
         }
@@ -2750,13 +3050,16 @@ namespace GGUFMeta {
                     __func__, override_type_to_str(ovrd->tag), ovrd->key);
                 switch (ovrd->tag) {
                     case LLAMA_KV_OVERRIDE_TYPE_BOOL:  {
-                        LLAMA_LOG_INFO("%s\n", ovrd->bool_value ? "true" : "false");
+                        LLAMA_LOG_INFO("%s\n", ovrd->val_bool ? "true" : "false");
                     } break;
                     case LLAMA_KV_OVERRIDE_TYPE_INT:   {
-                        LLAMA_LOG_INFO("%" PRId64 "\n", ovrd->int_value);
+                        LLAMA_LOG_INFO("%" PRId64 "\n", ovrd->val_i64);
                     } break;
                     case LLAMA_KV_OVERRIDE_TYPE_FLOAT: {
-                        LLAMA_LOG_INFO("%.6f\n", ovrd->float_value);
+                        LLAMA_LOG_INFO("%.6f\n", ovrd->val_f64);
+                    } break;
+                    case LLAMA_KV_OVERRIDE_TYPE_STR: {
+                        LLAMA_LOG_INFO("%s\n", ovrd->val_str);
                     } break;
                     default:
                         // Shouldn't be possible to end up here, but just in case...
@@ -2775,7 +3078,7 @@ namespace GGUFMeta {
         static typename std::enable_if<std::is_same<OT, bool>::value, bool>::type
         try_override(OT & target, const struct llama_model_kv_override * ovrd) {
             if (validate_override(LLAMA_KV_OVERRIDE_TYPE_BOOL, ovrd)) {
-                target = ovrd->bool_value;
+                target = ovrd->val_bool;
                 return true;
             }
             return false;
@@ -2785,7 +3088,7 @@ namespace GGUFMeta {
         static typename std::enable_if<!std::is_same<OT, bool>::value && std::is_integral<OT>::value, bool>::type
         try_override(OT & target, const struct llama_model_kv_override * ovrd) {
             if (validate_override(LLAMA_KV_OVERRIDE_TYPE_INT, ovrd)) {
-                target = ovrd->int_value;
+                target = ovrd->val_i64;
                 return true;
             }
             return false;
@@ -2795,7 +3098,7 @@ namespace GGUFMeta {
         static typename std::enable_if<std::is_floating_point<OT>::value, bool>::type
         try_override(T & target, const struct llama_model_kv_override * ovrd) {
             if (validate_override(LLAMA_KV_OVERRIDE_TYPE_FLOAT, ovrd)) {
-                target = ovrd->float_value;
+                target = ovrd->val_f64;
                 return true;
             }
             return false;
@@ -2804,12 +3107,11 @@ namespace GGUFMeta {
         template<typename OT>
         static typename std::enable_if<std::is_same<OT, std::string>::value, bool>::type
         try_override(T & target, const struct llama_model_kv_override * ovrd) {
-            (void)target;
-            (void)ovrd;
-            if (!ovrd) { return false; }
-            // Currently, we should never end up here so it would be a bug if we do.
-            throw std::runtime_error(format("Unsupported attempt to override string type for metadata key %s\n",
-                ovrd ? ovrd->key : "NULL"));
+            if (validate_override(LLAMA_KV_OVERRIDE_TYPE_STR, ovrd)) {
+                target = ovrd->val_str;
+                return true;
+            }
+            return false;
         }
 
         static bool set(const gguf_context * ctx, const int k, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
@@ -2842,6 +3144,7 @@ struct llama_model_loader {
     size_t  n_bytes    = 0;
 
     bool use_mmap = false;
+    bool check_tensors;
 
     llama_files files;
     llama_ftype ftype;
@@ -2849,19 +3152,23 @@ struct llama_model_loader {
 
     llama_mmaps mappings;
 
-    // Holds information on a model weights
-    struct llama_tensor_weights {
+    // Holds information on a model weight
+    struct llama_tensor_weight {
         uint16_t  idx; // source file index
         size_t   offs; // tensor data offset in the original file
 
         ggml_tensor * tensor;
 
-        llama_tensor_weights(uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+        llama_tensor_weight(const llama_file * file, uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx, name);
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+
+            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size) {
+                throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", name));
+            }
         }
     };
-    std::vector<llama_tensor_weights> weights;
+    std::vector<llama_tensor_weight> weights;
 
     std::unordered_map<std::string, struct llama_model_kv_override> kv_overrides;
 
@@ -2871,7 +3178,7 @@ struct llama_model_loader {
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 
-    llama_model_loader(const std::string & fname, bool use_mmap, const struct llama_model_kv_override * param_overrides_p) {
+    llama_model_loader(const std::string & fname, bool use_mmap, bool check_tensors, const struct llama_model_kv_override * param_overrides_p) {
         int trace = 0;
         if (getenv("LLAMA_TRACE")) {
             trace = atoi(getenv("LLAMA_TRACE"));
@@ -2897,15 +3204,15 @@ struct llama_model_loader {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
+        files.emplace_back(new llama_file(fname.c_str(), "rb"));
+        contexts.emplace_back(ctx);
+
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-            weights.emplace_back(llama_tensor_weights(0, cur->name, meta, cur));
+            weights.emplace_back(files.back().get(), 0, cur->name, meta, cur);
         }
-        files.emplace_back(new llama_file(fname.c_str(), "rb"));
-        contexts.emplace_back(ctx);
-
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
 
@@ -2939,12 +3246,13 @@ struct llama_model_loader {
                     throw std::runtime_error(format("%s: failed to load GGUF split from %s\n", __func__, split_path));
                 }
 
-                // Save tensors data offset info of the shard.
-                for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-                    weights.emplace_back(llama_tensor_weights(idx, cur->name, ctx_gguf, cur));
-                }
                 files.emplace_back(new llama_file(split_path, "rb"));
                 contexts.emplace_back(ctx);
+
+                // Save tensors data offset info of the shard.
+                for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                    weights.emplace_back(files.back().get(), idx, cur->name, ctx_gguf, cur);
+                }
 
                 gguf_free(ctx_gguf);
             }
@@ -2967,9 +3275,17 @@ struct llama_model_loader {
 
         fver = (enum llama_fver) gguf_get_version(meta);
 
+        std::set<std::string> tensor_names;
         for (auto & w : weights) {
             n_elements += ggml_nelements(w.tensor);
             n_bytes    += ggml_nbytes(w.tensor);
+            // make sure there is no duplicated tensor names
+            const std::string name(w.tensor->name);
+            auto found = tensor_names.find(name);
+            if (found != tensor_names.end()) {
+                throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", w.tensor->name));
+            }
+            tensor_names.insert(name);
         }
 
         LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
@@ -3003,6 +3319,7 @@ struct llama_model_loader {
             switch (type_max) {
                 case GGML_TYPE_F32:     ftype = LLAMA_FTYPE_ALL_F32;        break;
                 case GGML_TYPE_F16:     ftype = LLAMA_FTYPE_MOSTLY_F16;     break;
+                case GGML_TYPE_BF16:    ftype = LLAMA_FTYPE_MOSTLY_BF16;    break;
                 case GGML_TYPE_Q4_0:    ftype = LLAMA_FTYPE_MOSTLY_Q4_0;    break;
                 case GGML_TYPE_Q4_1:    ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
                 case GGML_TYPE_Q5_0:    ftype = LLAMA_FTYPE_MOSTLY_Q5_0;    break;
@@ -3018,6 +3335,7 @@ struct llama_model_loader {
                 case GGML_TYPE_IQ2_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ2_S;   break;
                 case GGML_TYPE_IQ3_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ3_XXS; break;
                 case GGML_TYPE_IQ1_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_S;   break;
+                case GGML_TYPE_IQ1_M:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_M;   break;
                 case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
                 case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
                 case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
@@ -3074,6 +3392,7 @@ struct llama_model_loader {
         }
 
         this->use_mmap = use_mmap;
+        this->check_tensors = check_tensors;
     }
 
     ~llama_model_loader() {
@@ -3112,6 +3431,39 @@ struct llama_model_loader {
     }
 
     template<typename T>
+    bool get_arr(const std::string & key, std::vector<T> & result, const bool required = true) {
+        const int kid = gguf_find_key(meta, key.c_str());
+
+        if (kid < 0) {
+            if (required) {
+                throw std::runtime_error(format("key not found in model: %s", key.c_str()));
+            }
+            return false;
+        }
+
+        struct GGUFMeta::ArrayInfo arr_info =
+            GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(meta, kid);
+
+        if (arr_info.gt != GGUF_TYPE_FLOAT32 && arr_info.gt != GGUF_TYPE_INT32) {
+            throw std::runtime_error(format("%s is not a float32 or int32 array", key.c_str()));
+        }
+
+        // GGML_ASSERT(gguf_type_size(arr_info.gt) == sizeof(T));
+        GGML_ASSERT((arr_info.gt != GGUF_TYPE_FLOAT32 || std::is_same<T, float>::value));
+        GGML_ASSERT((arr_info.gt != GGUF_TYPE_INT32   || std::is_same<T, int>::value));
+
+        result.resize(arr_info.length);
+        result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
+
+        return true;
+    }
+
+    template<typename T>
+    bool get_arr(const enum llm_kv kid, T& result, const bool required = true) {
+        return get_arr(llm_kv(kid), result, required);
+    }
+
+    template<typename T>
     bool get_key(const std::string & key, T & result, const bool required = true) {
         auto it = kv_overrides.find(key);
 
@@ -3144,37 +3496,61 @@ struct llama_model_loader {
         return weights.at(i).tensor->name;
     }
 
-    const llama_tensor_weights & get_weights(const char * name) const {
+    const llama_tensor_weight * get_weight(const char * name) const {
         for (const auto & weight : weights) {
             if (strcmp(name, weight.tensor->name) == 0) {
-                return weight;
+                return &weight;
             }
         }
-        throw std::runtime_error(format("tensor %s not found", name));
+        return nullptr;
+    }
+
+    const llama_tensor_weight * get_weight(int i) const {
+        return get_weight(get_tensor_name(i));
+    }
+
+    const llama_tensor_weight & require_weight(const char * name) const {
+        const llama_tensor_weight * weight = get_weight(name);
+        if (!weight) {
+            throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name));
+        }
+        return *weight;
     }
 
     struct ggml_tensor * get_tensor_meta(const char * name) const {
-        try {
-            return get_weights(name).tensor;
-        } catch (const std::runtime_error & e) {
-            return NULL;
+        const auto * weight = get_weight(name);
+        if (!weight) {
+            return nullptr;
         }
+        return weight->tensor;
+    }
+
+    struct ggml_tensor * require_tensor_meta(const char * name) const {
+        struct ggml_tensor * tensor = get_tensor_meta(name);
+        if (!tensor) {
+            throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name));
+        }
+        return tensor;
     }
 
     struct ggml_tensor * get_tensor_meta(int i) const {
         return get_tensor_meta(get_tensor_name(i));
     }
 
-    struct ggml_tensor * create_tensor_for(struct ggml_context * ctx, const struct ggml_tensor * cur) {
+    struct ggml_tensor * create_tensor_for(struct ggml_context * ctx, const struct ggml_tensor * cur, bool duplicated) {
         struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
         ggml_set_name(tensor, ggml_get_name(cur));
 
-        n_created++;
+        if (duplicated) {
+            size_data += ggml_nbytes(cur);
+        } else {
+            n_created++;
+        }
 
         return tensor;
     }
 
-    struct ggml_tensor * create_tensor(struct ggml_context * ctx, const std::string & name, const std::vector<int64_t> & ne, bool required = true) {
+    const struct ggml_tensor * check_tensor_dims(const std::string & name, const std::vector<int64_t> & ne, bool required) const {
         const struct ggml_tensor * cur = get_tensor_meta(name.c_str());
 
         if (cur == NULL) {
@@ -3186,8 +3562,8 @@ struct llama_model_loader {
 
         {
             bool is_ok = true;
-            for (size_t i = 0; i < ne.size(); ++i) {
-                if (ne[i] != cur->ne[i]) {
+            for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+                if ((i < ne.size() && ne[i] != cur->ne[i]) || (i >= ne.size() && cur->ne[i] != 1)) {
                     is_ok = false;
                     break;
                 }
@@ -3201,7 +3577,48 @@ struct llama_model_loader {
             }
         }
 
-        return create_tensor_for(ctx, cur);
+        return cur;
+    }
+
+    static const int TENSOR_NOT_REQUIRED = 1;
+    static const int TENSOR_DUPLICATED   = 2;
+
+    struct ggml_tensor * create_tensor(struct ggml_context * ctx, const std::string & name, const std::vector<int64_t> & ne, int flags = 0) {
+        const struct ggml_tensor * cur = check_tensor_dims(name, ne, !(flags & TENSOR_NOT_REQUIRED));
+
+        if (cur == NULL) {
+            return NULL;
+        }
+
+        return create_tensor_for(ctx, cur, flags & TENSOR_DUPLICATED);
+    }
+
+    struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::vector<int64_t> & ne, size_t offset, bool required = true) {
+        const struct ggml_tensor * cur = check_tensor_dims(name, ne, required);
+
+        if (cur == NULL) {
+            return NULL;
+        }
+
+        if (cur->type != base->type) {
+            throw std::runtime_error(format("%s: tensor '%s' has wrong type; expected %s, got %s", __func__, name.c_str(), ggml_type_name(base->type), ggml_type_name(cur->type)));
+        }
+
+        std::array<int64_t, GGML_MAX_DIMS> dims;
+        for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+            dims[i] = i < ne.size() ? ne[i] : 1;
+        }
+
+        struct ggml_tensor * tensor = ggml_view_4d(ctx, base,
+                                        dims[0], dims[1], dims[2], dims[3],
+                                        cur->nb[1], cur->nb[2], cur->nb[3],
+                                        offset);
+
+        ggml_set_name(tensor, name.c_str());
+
+        n_created++;
+
+        return tensor;
     }
 
     void done_getting_tensors() const {
@@ -3216,7 +3633,7 @@ struct llama_model_loader {
             mmaps_used.reserve(files.size());
             for (const auto & file : files) {
                 std::unique_ptr<llama_mmap> mapping(new llama_mmap(file.get(), prefetch ? -1 : 0, ggml_is_numa()));
-                mmaps_used.emplace_back(std::make_pair(mapping->size, 0));
+                mmaps_used.emplace_back(mapping->size, 0);
                 if (mlock_mmaps) {
                     std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                     mlock_mmap->init(mapping->addr);
@@ -3240,18 +3657,25 @@ struct llama_model_loader {
         *last  = 0;
         *addr = mapping->addr;
         for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
-            const auto & w = get_weights(ggml_get_name(tensor));
-            if (w.idx != idx) {
-                continue;
+            try {
+                const auto * weight = get_weight(ggml_get_name(tensor));
+                if (!weight) {
+                    continue;
+                }
+                if (weight->idx != idx) {
+                    continue;
+                }
+                *first = std::min(*first, weight->offs);
+                *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
+            } catch(...) {
+                // the tensor is not in the model
             }
-            *first = std::min(*first, w.offs);
-            *last  = std::max(*last,  w.offs + ggml_nbytes(tensor));
         }
     }
 
     // for backwards compatibility, does not support ggml-backend
     void load_data_for(struct ggml_tensor * cur) const {
-        const auto & w = get_weights(ggml_get_name(cur));
+        const auto & w = require_weight(ggml_get_name(cur));
 
         if (use_mmap) {
             const auto & mapping = mappings.at(w.idx);
@@ -3266,6 +3690,10 @@ struct llama_model_loader {
             const auto & file = files.at(w.idx);
             file->seek(w.offs, SEEK_SET);
             file->read_raw(cur->data, ggml_nbytes(cur));
+        }
+
+        if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
+            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
         }
     }
 
@@ -3283,51 +3711,87 @@ struct llama_model_loader {
         GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
         std::vector<no_init<uint8_t>> read_buf;
+        std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+
         for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+            const auto * weight = get_weight(ggml_get_name(cur));
+            if (weight == nullptr) {
+                // this can happen with split experts models
+                continue;
+            }
+
             if (progress_callback) {
                 if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                     return false;
                 }
             }
 
-            const auto & w = get_weights(ggml_get_name(cur));
             size_t n_size = ggml_nbytes(cur);
 
             if (use_mmap) {
-                const auto & mapping = mappings.at(w.idx);
+                const auto & mapping = mappings.at(weight->idx);
                 ggml_backend_buffer_t buf_mmap = nullptr;
-                if (bufs_mmap.count(w.idx)) {
-                    buf_mmap = bufs_mmap.at(w.idx);
+                if (bufs_mmap.count(weight->idx)) {
+                    buf_mmap = bufs_mmap.at(weight->idx);
                 }
+                uint8_t * data = (uint8_t *) mapping->addr + weight->offs;
+
+                if (check_tensors) {
+                    validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
+                    }));
+                }
+
                 GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
                 if (buf_mmap && cur->data == nullptr) {
-                    ggml_backend_tensor_alloc(buf_mmap, cur, (uint8_t *) mapping->addr + w.offs);
+                    ggml_backend_tensor_alloc(buf_mmap, cur, data);
                     if (lmlocks) {
-                        const auto & lmlock = lmlocks->at(w.idx);
-                        lmlock->grow_to(w.offs + ggml_nbytes(cur));
+                        const auto & lmlock = lmlocks->at(weight->idx);
+                        lmlock->grow_to(weight->offs + n_size);
                     }
 
-                    auto & mmap_used = mmaps_used[w.idx];
-                    mmap_used.first  = std::min(mmap_used.first,  w.offs);
-                    mmap_used.second = std::max(mmap_used.second, w.offs + n_size);
+                    auto & mmap_used = mmaps_used[weight->idx];
+                    mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                    mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
                 } else {
-                    ggml_backend_tensor_set(cur, (uint8_t *) mapping->addr + w.offs, 0, n_size);
+                    ggml_backend_tensor_set(cur, data, 0, n_size);
                 }
             } else {
-                GGML_ASSERT(w.idx < files.size());
-                const auto & file = files.at(w.idx);
+                GGML_ASSERT(weight->idx < files.size());
+                const auto & file = files.at(weight->idx);
                 if (ggml_backend_buffer_is_host(cur->buffer)) {
-                    file->seek(w.offs, SEEK_SET);
-                    file->read_raw(cur->data, ggml_nbytes(cur));
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                    if (check_tensors) {
+                        validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                            return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                        }));
+                    }
                 } else {
-                    read_buf.resize(ggml_nbytes(cur));
-                    file->seek(w.offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), ggml_nbytes(cur));
+                    read_buf.resize(n_size);
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(read_buf.data(), n_size);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                    }
                 }
             }
 
             size_done += n_size;
+        }
+
+        // check validation results
+        bool validation_failed = false;
+        for (auto & future : validation_result) {
+            auto result = future.get();
+            if (!result.second) {
+                LLAMA_LOG_ERROR("%s: tensor '%s' has invalid data\n", __func__, ggml_get_name(result.first));
+                validation_failed = true;
+            }
+        }
+        if (validation_failed) {
+            throw std::runtime_error("found tensors with invalid data");
         }
 
         // check if this is the last call and do final cleanup
@@ -3387,6 +3851,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
     switch (ftype) {
         case LLAMA_FTYPE_ALL_F32:     return "all F32";
         case LLAMA_FTYPE_MOSTLY_F16:  return "F16";
+        case LLAMA_FTYPE_MOSTLY_BF16: return "BF16";
         case LLAMA_FTYPE_MOSTLY_Q4_0: return "Q4_0";
         case LLAMA_FTYPE_MOSTLY_Q4_1: return "Q4_1";
         case LLAMA_FTYPE_MOSTLY_Q4_1_SOME_F16:
@@ -3413,6 +3878,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_XS: return "IQ3_XS - 3.3 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_XXS:return "IQ3_XXS - 3.0625 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ1_S  :return "IQ1_S - 1.5625 bpw";
+        case LLAMA_FTYPE_MOSTLY_IQ1_M  :return "IQ1_M - 1.75 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_NL: return "IQ4_NL - 4.5 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_XS: return "IQ4_XS - 4.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_S:  return "IQ3_S - 3.4375 bpw";
@@ -3424,32 +3890,50 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
 
 static const char * llama_model_type_name(e_model type) {
     switch (type) {
-        case MODEL_22M:    return "22M";
-        case MODEL_33M:    return "33M";
-        case MODEL_109M:   return "109M";
-        case MODEL_137M:   return "137M";
-        case MODEL_0_5B:   return "0.5B";
-        case MODEL_1B:     return "1B";
-        case MODEL_2B:     return "2B";
-        case MODEL_3B:     return "3B";
-        case MODEL_7B:     return "7B";
-        case MODEL_8B:     return "8B";
-        case MODEL_13B:    return "13B";
-        case MODEL_14B:    return "14B";
-        case MODEL_15B:    return "15B";
-        case MODEL_20B:    return "20B";
-        case MODEL_30B:    return "30B";
-        case MODEL_34B:    return "34B";
-        case MODEL_35B:    return "35B";
-        case MODEL_40B:    return "40B";
-        case MODEL_65B:    return "65B";
-        case MODEL_70B:    return "70B";
-        case MODEL_314B:   return "314B";
-        case MODEL_SMALL:  return "0.1B";
-        case MODEL_MEDIUM: return "0.4B";
-        case MODEL_LARGE:  return "0.8B";
-        case MODEL_XL:     return "1.5B";
-        default:           return "?B";
+        case MODEL_14M:           return "14M";
+        case MODEL_17M:           return "17M";
+        case MODEL_22M:           return "22M";
+        case MODEL_33M:           return "33M";
+        case MODEL_70M:           return "70M";
+        case MODEL_109M:          return "109M";
+        case MODEL_137M:          return "137M";
+        case MODEL_160M:          return "160M";
+        case MODEL_335M:          return "335M";
+        case MODEL_410M:          return "410M";
+        case MODEL_0_5B:          return "0.5B";
+        case MODEL_1B:            return "1B";
+        case MODEL_1_4B:          return "1.4B";
+        case MODEL_2B:            return "2B";
+        case MODEL_2_8B:          return "2.8B";
+        case MODEL_3B:            return "3B";
+        case MODEL_4B:            return "4B";
+        case MODEL_6_9B:          return "6.9B";
+        case MODEL_7B:            return "7B";
+        case MODEL_8B:            return "8B";
+        case MODEL_12B:           return "12B";
+        case MODEL_13B:           return "13B";
+        case MODEL_14B:           return "14B";
+        case MODEL_15B:           return "15B";
+        case MODEL_16B:           return "16B";
+        case MODEL_20B:           return "20B";
+        case MODEL_30B:           return "30B";
+        case MODEL_34B:           return "34B";
+        case MODEL_35B:           return "35B";
+        case MODEL_40B:           return "40B";
+        case MODEL_65B:           return "65B";
+        case MODEL_70B:           return "70B";
+        case MODEL_236B:          return "236B";
+        case MODEL_314B:          return "314B";
+        case MODEL_SMALL:         return "0.1B";
+        case MODEL_MEDIUM:        return "0.4B";
+        case MODEL_LARGE:         return "0.8B";
+        case MODEL_XL:            return "1.5B";
+        case MODEL_A2_7B:         return "A2.7B";
+        case MODEL_8x7B:          return "8x7B";
+        case MODEL_8x22B:         return "8x22B";
+        case MODEL_16x12B:        return "16x12B";
+        case MODEL_10B_128x3_66B: return "10B+128x3.66B";
+        default:                  return "?B";
     }
 }
 
@@ -3492,6 +3976,12 @@ static void llm_load_hparams(
 
     // get hparams kv
     ml.get_key(LLM_KV_VOCAB_SIZE,           hparams.n_vocab,       false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, hparams.n_vocab);
+
+    // everything past this point is not vocab-related
+    if (hparams.vocab_only) {
+        return;
+    }
+
     ml.get_key(LLM_KV_CONTEXT_LENGTH,       hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,     hparams.n_embd);
     ml.get_key(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff);
@@ -3516,8 +4006,8 @@ static void llm_load_hparams(
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
     hparams.rope_finetuned = rope_finetuned;
 
-    hparams.n_yarn_orig_ctx = hparams.n_ctx_train;
-    ml.get_key(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN, hparams.n_yarn_orig_ctx, false);
+    hparams.n_ctx_orig_yarn = hparams.n_ctx_train;
+    ml.get_key(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN, hparams.n_ctx_orig_yarn, false);
 
     // rope_freq_base (optional)
     hparams.rope_freq_base_train = 10000.0f;
@@ -3535,6 +4025,8 @@ static void llm_load_hparams(
         ml.get_key(LLM_KV_ROPE_SCALE_LINEAR, ropescale, false);
     }
     hparams.rope_freq_scale_train = ropescale == 0.0f ? 1.0f : 1.0f/ropescale;
+
+    ml.get_key(LLM_KV_ROPE_SCALING_ATTN_FACTOR, hparams.rope_attn_factor, false);
 
     // sanity check for n_rot (optional)
     {
@@ -3563,15 +4055,25 @@ static void llm_load_hparams(
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-                switch (hparams.n_layer) {
-                    case 22: model.type = e_model::MODEL_1B; break;
-                    case 26: model.type = e_model::MODEL_3B; break;
-                    case 32: model.type = e_model::MODEL_7B; break;
-                    case 40: model.type = e_model::MODEL_13B; break;
-                    case 48: model.type = e_model::MODEL_34B; break;
-                    case 60: model.type = e_model::MODEL_30B; break;
-                    case 80: model.type = hparams.n_head == hparams.n_head_kv ? e_model::MODEL_65B : e_model::MODEL_70B; break;
-                    default: model.type = e_model::MODEL_UNKNOWN;
+                if (hparams.n_expert == 8) {
+                    switch (hparams.n_layer) {
+                        case 32: model.type = e_model::MODEL_8x7B; break;
+                        case 56: model.type = e_model::MODEL_8x22B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
+                } else {
+                    switch (hparams.n_layer) {
+                        case 22: model.type = e_model::MODEL_1B; break;
+                        case 26: model.type = e_model::MODEL_3B; break;
+                        // granite uses a vocab with len 49152
+                        case 32: model.type = hparams.n_vocab == 49152 ? e_model::MODEL_3B : (hparams.n_vocab < 40000 ? e_model::MODEL_7B : e_model::MODEL_8B); break;
+                        case 36: model.type = e_model::MODEL_8B; break; // granite
+                        case 40: model.type = e_model::MODEL_13B; break;
+                        case 48: model.type = e_model::MODEL_34B; break;
+                        case 60: model.type = e_model::MODEL_30B; break;
+                        case 80: model.type = hparams.n_head == hparams.n_head_kv ? e_model::MODEL_65B : e_model::MODEL_70B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
                 }
             } break;
         case LLM_ARCH_MINICPM:
@@ -3627,14 +4129,6 @@ static void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
-        case LLM_ARCH_PERSIMMON:
-            {
-                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
-                switch (hparams.n_layer) {
-                    case 36: model.type = e_model::MODEL_8B; break;
-                    default: model.type = e_model::MODEL_UNKNOWN;
-                }
-            } break;
         case LLM_ARCH_REFACT:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -3665,6 +4159,19 @@ static void llm_load_hparams(
                         } break;
                     case 24:
                         model.type = e_model::MODEL_335M; break; // bge-large
+                }
+            } break;
+        case LLM_ARCH_JINA_BERT_V2:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,    hparams.f_norm_eps);
+                ml.get_key(LLM_KV_ATTENTION_CAUSAL,           hparams.causal_attn);
+                ml.get_key(LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT, hparams.n_vocab_type);
+                ml.get_key(LLM_KV_POOLING_TYPE,               hparams.pooling_type);
+                hparams.f_max_alibi_bias = 8.0f;
+
+                switch (hparams.n_layer) {
+                    case 4: model.type = e_model::MODEL_33M; break; // jina-embeddings-small
+                    case 12: model.type = e_model::MODEL_137M; break; // jina-embeddings-base
                 }
             } break;
         case LLM_ARCH_NOMIC_BERT:
@@ -3713,6 +4220,7 @@ static void llm_load_hparams(
                 switch (hparams.n_layer) {
                     case 24: model.type = e_model::MODEL_1B; break;
                     case 32: model.type = e_model::MODEL_3B; break;
+                    case 40: model.type = e_model::MODEL_12B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                }
             } break;
@@ -3737,6 +4245,14 @@ static void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_QWEN2MOE:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                switch (hparams.n_layer) {
+                    case 24: model.type = e_model::MODEL_A2_7B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_PHI2:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
@@ -3744,6 +4260,17 @@ static void llm_load_hparams(
                 switch (hparams.n_layer) {
                     case 24: model.type = e_model::MODEL_1B; break;
                     case 32: model.type = e_model::MODEL_3B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_PHI3:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                switch (hparams.n_layer) {
+                    case 24: model.type = e_model::MODEL_1B; break;
+                    case 32: model.type = e_model::MODEL_3B; break;
+                    case 40: model.type = e_model::MODEL_14B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
@@ -3810,6 +4337,8 @@ static void llm_load_hparams(
                     case 30: model.type = e_model::MODEL_3B; break;
                     case 32: model.type = e_model::MODEL_7B; break;
                     case 40: model.type = e_model::MODEL_15B; break;
+                    case 52: model.type = e_model::MODEL_20B; break; // granite
+                    case 88: model.type = e_model::MODEL_34B; break; // granite
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
@@ -3843,6 +4372,16 @@ static void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_XVERSE:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                switch (hparams.n_layer) {
+                    case 32: model.type = e_model::MODEL_7B; break;
+                    case 40: model.type = e_model::MODEL_13B; break;
+                    case 80: model.type = e_model::MODEL_65B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_COMMAND_R:
             {
                 ml.get_key(LLM_KV_LOGIT_SCALE, hparams.f_logit_scale);
@@ -3852,20 +4391,123 @@ static void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_DBRX:
+        {
+            ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,  hparams.f_norm_eps);
+            ml.get_key(LLM_KV_ATTENTION_CLAMP_KQV,      hparams.f_clamp_kqv);
+
+            switch (hparams.n_layer) {
+                case 40: model.type = e_model::MODEL_16x12B; break;
+                default: model.type = e_model::MODEL_UNKNOWN;
+            }
+        } break;
+        case LLM_ARCH_OLMO:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
+                ml.get_key(LLM_KV_ATTENTION_CLAMP_KQV,     hparams.f_clamp_kqv, false);
+
+                switch (hparams.n_layer) {
+                    case 22: model.type = e_model::MODEL_1B; break;
+                    case 32: model.type = e_model::MODEL_7B; break;
+                    case 80: model.type = e_model::MODEL_70B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_GPTNEOX:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
+                ml.get_key(LLM_KV_USE_PARALLEL_RESIDUAL, hparams.use_par_res);
+                switch (hparams.n_layer) {
+                    case 6:
+                        switch (hparams.n_ff) {
+                            case 512: model.type = e_model::MODEL_14M; break;
+                            case 2048: model.type = e_model::MODEL_70M; break;
+                            default: model.type = e_model::MODEL_UNKNOWN;
+                        } break;
+                    case 12:
+                        switch (hparams.n_ff) {
+                            case 3072: model.type = e_model::MODEL_160M; break;
+                            default: model.type = e_model::MODEL_UNKNOWN;
+                        } break;
+                    case 16:
+                        switch (hparams.n_ff) {
+                            case 8192: model.type = e_model::MODEL_1B; break;
+                            default: model.type = e_model::MODEL_UNKNOWN;
+                        } break;
+                    case 24:
+                        switch (hparams.n_ff) {
+                            case 4096: model.type = e_model::MODEL_410M; break;
+                            case 8192: model.type = e_model::MODEL_1_4B; break;
+                            default: model.type = e_model::MODEL_UNKNOWN;
+                        } break;
+                    case 32:
+                        switch (hparams.n_ff) {
+                            case 10240: model.type = e_model::MODEL_2_8B; break;
+                            case 16384: model.type = e_model::MODEL_6_9B; break;
+                            default: model.type = e_model::MODEL_UNKNOWN;
+                        } break;
+                    case 36:
+                        switch (hparams.n_ff) {
+                            case 20480: model.type = e_model::MODEL_12B; break;
+                            default: model.type = e_model::MODEL_UNKNOWN;
+                        } break;
+                    case 44:
+                        switch (hparams.n_ff) {
+                            case 24576: model.type = e_model::MODEL_20B; break;
+                            default: model.type = e_model::MODEL_UNKNOWN;
+                        } break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_ARCTIC:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                if (hparams.n_expert == 128) {
+                    switch (hparams.n_layer) {
+                        case 35: model.type = e_model::MODEL_10B_128x3_66B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
+                } else {
+                    model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_DEEPSEEK2:
+            {
+                bool is_lite = (hparams.n_layer == 27);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT, hparams.n_layer_dense_lead);
+                if (!is_lite) {
+                    ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK, hparams.n_lora_q);
+                }
+                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK, hparams.n_lora_kv);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT, hparams.n_expert_shared);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE, hparams.expert_weights_scale);
+                ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL, hparams.rope_yarn_log_mul);
+
+                switch (hparams.n_layer) {
+                    case 27: model.type = e_model::MODEL_16B; break;
+                    case 60: model.type = e_model::MODEL_236B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         default: (void)0;
     }
 
     model.ftype = ml.ftype;
 
     if (hparams.f_max_alibi_bias > 0.0f) {
-        hparams.need_kq_pos = true;
+        hparams.use_alibi = true;
     }
 
     hparams.rope_type = llama_rope_type(&model);
 }
 
 // TODO: This should probably be in llama.h
-static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & vocab, std::string raw_text, bool bos, bool special = false);
+static std::vector<llama_vocab::id> llama_tokenize_internal(
+    const llama_vocab & vocab, std::string raw_text, bool add_special, bool parse_special = false
+);
 static llama_token llama_byte_to_token(const llama_vocab & vocab, uint8_t ch);
 
 static void llm_load_vocab(
@@ -3879,38 +4521,90 @@ static void llm_load_vocab(
 
     // determine vocab type
     {
-        std::string tokenizer_name;
+        std::string tokenizer_model;
+        std::string tokenizer_pre;
 
-        ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_name);
+        ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_model);
+        ml.get_key(LLM_KV_TOKENIZER_PRE,   tokenizer_pre, false);
 
-        if (tokenizer_name == "no_vocab") {
+        if (tokenizer_model == "no_vocab") {
             vocab.type = LLAMA_VOCAB_TYPE_NONE;
 
             // default special tokens
-            vocab.special_bos_id = -1;
-            vocab.special_eos_id = -1;
-            vocab.special_unk_id = -1;
-            vocab.special_sep_id = -1;
-            vocab.special_pad_id = -1;
-            vocab.linefeed_id    = -1;
+            vocab.special_bos_id  = -1;
+            vocab.special_eos_id  = -1;
+            vocab.special_unk_id  = -1;
+            vocab.special_sep_id  = -1;
+            vocab.special_pad_id  = -1;
+            vocab.special_cls_id  = -1;
+            vocab.special_mask_id = -1;
+            vocab.linefeed_id     = -1;
 
             return;
-        } else if (tokenizer_name == "llama") {
+        } else if (tokenizer_model == "llama") {
             vocab.type = LLAMA_VOCAB_TYPE_SPM;
 
             // default special tokens
-            vocab.special_bos_id = 1;
-            vocab.special_eos_id = 2;
-            vocab.special_unk_id = 0;
-            vocab.special_sep_id = -1;
-            vocab.special_pad_id = -1;
+            vocab.special_bos_id  = 1;
+            vocab.special_eos_id  = 2;
+            vocab.special_unk_id  = 0;
+            vocab.special_sep_id  = -1;
+            vocab.special_pad_id  = -1;
+            vocab.special_cls_id  = -1;
+            vocab.special_mask_id = -1;
+
+            // For Fill-In-the-Middle (FIM)/infill models which where converted
+            // prior to support of FIM special tokens in GGUF, the following
+            // will allow those models to continue to work. The general names
+            // of the known models are currently CodeLlama (LLM_ARCH_LLAMA) and
+            // CodeGemma (LLM_ARCH_GEMMA). This can potentially be removed once
+            // new versions of these models have been published.
+            std::string gen_name;
+            ml.get_key(LLM_KV_GENERAL_NAME, gen_name, false);
+
+            std::transform(gen_name.begin(), gen_name.end(), gen_name.begin(),
+                [](unsigned char c){ return std::tolower(c); });
+
+            if (gen_name.find("code") != std::string::npos) {
+                if (model.arch == LLM_ARCH_LLAMA) {
+                    vocab.special_prefix_id = 32007;
+                    vocab.special_suffix_id = 32008;
+                    vocab.special_middle_id = 32009;
+                    vocab.special_eot_id    = 32010;
+                } else if (model.arch == LLM_ARCH_GEMMA) {
+                    vocab.special_prefix_id = 67;
+                    vocab.special_suffix_id = 69;
+                    vocab.special_middle_id = 68;
+                    // TODO: this is not EOT, it is "file separator" token, needs fix
+                    //       https://huggingface.co/google/codegemma-7b-it/blob/9b1d9231388358c04d90bd003458f5070d97db44/tokenizer_config.json#L565-L572
+                    //vocab.special_eot_id    = 70;
+                    vocab.special_eot_id    = 107;
+                }
+            }
 
             const int add_space_prefix_keyidx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_ADD_PREFIX).c_str());
             if (add_space_prefix_keyidx != -1) {
                 vocab.add_space_prefix = gguf_get_val_bool(ctx, add_space_prefix_keyidx);
             } // The default value of add_space_prefix is true.
-        } else if (tokenizer_name == "gpt2") {
+        } else if (tokenizer_model == "bert") {
+            vocab.type = LLAMA_VOCAB_TYPE_WPM;
+
+            // default special tokens
+            vocab.special_bos_id  = -1;
+            vocab.special_eos_id  = -1;
+            vocab.special_unk_id  = 100;
+            vocab.special_sep_id  = 102;
+            vocab.special_pad_id  = 0;
+            vocab.special_cls_id  = 101;
+            vocab.special_mask_id = 103;
+            vocab.add_space_prefix = false;
+        } else if (tokenizer_model == "gpt2") {
             vocab.type = LLAMA_VOCAB_TYPE_BPE;
+
+            const int add_space_prefix_keyidx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_ADD_PREFIX).c_str());
+            if (add_space_prefix_keyidx != -1) {
+                vocab.add_space_prefix = gguf_get_val_bool(ctx, add_space_prefix_keyidx);
+            }
 
             // read bpe merges and populate bpe ranks
             const int merges_keyidx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_MERGES).c_str());
@@ -3938,26 +4632,84 @@ static void llm_load_vocab(
             }
 
             // default special tokens
-            vocab.special_bos_id = 11;
-            vocab.special_eos_id = 11;
-            vocab.special_unk_id = -1;
-            vocab.special_sep_id = -1;
-            vocab.special_pad_id = -1;
-        } else if (tokenizer_name == "bert") {
-            vocab.type = LLAMA_VOCAB_TYPE_WPM;
-
-            // default special tokens
-            vocab.special_bos_id = 101;
-            vocab.special_eos_id = 102;
-            vocab.special_unk_id = 100;
-            vocab.special_sep_id = -1;
-            vocab.special_pad_id = -1;
-            vocab.add_space_prefix = false;
+            vocab.special_bos_id  = 11;
+            vocab.special_eos_id  = 11;
+            vocab.special_unk_id  = -1;
+            vocab.special_sep_id  = -1;
+            vocab.special_pad_id  = -1;
+            vocab.special_cls_id  = -1;
+            vocab.special_mask_id = -1;
         } else {
-            LLAMA_LOG_WARN("%s: unknown tokenizer: '%s'", __func__, tokenizer_name.c_str());
-            LLAMA_LOG_WARN("%s: using default tokenizer: 'llama'", __func__);
+            throw std::runtime_error(format("unknown tokenizer: '%s'", tokenizer_model.c_str()));
+        }
 
-            vocab.type = LLAMA_VOCAB_TYPE_SPM;
+        // for now, only BPE models have pre-tokenizers
+        if (vocab.type == LLAMA_VOCAB_TYPE_BPE) {
+            if (tokenizer_pre.empty()) {
+                LLAMA_LOG_WARN("%s: missing pre-tokenizer type, using: 'default'\n", __func__);
+                LLAMA_LOG_WARN("%s:                                             \n", __func__);
+                LLAMA_LOG_WARN("%s: ************************************        \n", __func__);
+                LLAMA_LOG_WARN("%s: GENERATION QUALITY WILL BE DEGRADED!        \n", __func__);
+                LLAMA_LOG_WARN("%s: CONSIDER REGENERATING THE MODEL             \n", __func__);
+                LLAMA_LOG_WARN("%s: ************************************        \n", __func__);
+                LLAMA_LOG_WARN("%s:                                             \n", __func__);
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DEFAULT;
+            } else if (tokenizer_pre == "default") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DEFAULT;
+            } else if (
+                    tokenizer_pre == "llama3"   ||
+                    tokenizer_pre == "llama-v3" ||
+                    tokenizer_pre == "llama-bpe") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_LLAMA3;
+            } else if (
+                    tokenizer_pre == "deepseek-llm") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM;
+            } else if (
+                    tokenizer_pre == "deepseek-coder") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_CODER;
+            } else if (
+                    tokenizer_pre == "falcon") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_FALCON;
+            } else if (
+                    tokenizer_pre == "mpt") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_MPT;
+            } else if (
+                    tokenizer_pre == "starcoder") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_STARCODER;
+            } else if (
+                    tokenizer_pre == "gpt-2"   ||
+                    tokenizer_pre == "jina-es" ||
+                    tokenizer_pre == "jina-de" ||
+                    tokenizer_pre == "jina-v2-es" ||
+                    tokenizer_pre == "jina-v2-de" ||
+                    tokenizer_pre == "jina-v2-code") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_GPT2;
+            } else if (
+                    tokenizer_pre == "refact") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_REFACT;
+            } else if (
+                tokenizer_pre == "command-r") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_COMMAND_R;
+            } else if (
+                tokenizer_pre == "qwen2") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_QWEN2;
+            } else if (
+                tokenizer_pre == "stablelm2") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_STABLELM2;
+            } else if (
+                tokenizer_pre == "olmo") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_OLMO;
+            } else if (
+                tokenizer_pre == "dbrx") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DBRX;
+            } else if (
+                tokenizer_pre == "smaug-bpe") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_SMAUG;
+            } else {
+                throw std::runtime_error(format("unknown pre-tokenizer type: '%s'", tokenizer_pre.c_str()));
+            }
+        } else {
+            vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DEFAULT;
         }
     }
 
@@ -3991,7 +4743,20 @@ static void llm_load_vocab(
         auto & token_data = vocab.id_to_token[i];
         token_data.text  = std::move(word);
         token_data.score = scores ? scores[i] : 0.0f;
-        token_data.type  = toktypes ? (llama_token_type) toktypes[i] : LLAMA_TOKEN_TYPE_NORMAL;
+        token_data.attr  = LLAMA_TOKEN_ATTR_NORMAL;
+
+        if (toktypes) {  //TODO: remove, required until per token attributes are available from GGUF file
+            switch(toktypes[i]) {
+                case LLAMA_TOKEN_TYPE_UNKNOWN:      token_data.attr = LLAMA_TOKEN_ATTR_UNKNOWN;      break;
+                case LLAMA_TOKEN_TYPE_UNUSED:       token_data.attr = LLAMA_TOKEN_ATTR_UNUSED;       break;
+                case LLAMA_TOKEN_TYPE_NORMAL:       token_data.attr = LLAMA_TOKEN_ATTR_NORMAL;       break;
+                case LLAMA_TOKEN_TYPE_CONTROL:      token_data.attr = LLAMA_TOKEN_ATTR_CONTROL;      break;
+                case LLAMA_TOKEN_TYPE_USER_DEFINED: token_data.attr = LLAMA_TOKEN_ATTR_USER_DEFINED; break;
+                case LLAMA_TOKEN_TYPE_BYTE:         token_data.attr = LLAMA_TOKEN_ATTR_BYTE;         break;
+                case LLAMA_TOKEN_TYPE_UNDEFINED:    token_data.attr = LLAMA_TOKEN_ATTR_UNDEFINED;    break;
+                default:                            token_data.attr = LLAMA_TOKEN_ATTR_UNDEFINED;    break;
+            }
+        }
     }
     GGML_ASSERT(vocab.id_to_token.size() == vocab.token_to_id.size());
 
@@ -4014,12 +4779,19 @@ static void llm_load_vocab(
     // special tokens
     {
         const std::vector<std::pair<enum llm_kv, int32_t &>> special_token_types = {
-            { LLM_KV_TOKENIZER_BOS_ID, vocab.special_bos_id },
-            { LLM_KV_TOKENIZER_EOS_ID, vocab.special_eos_id },
-            { LLM_KV_TOKENIZER_UNK_ID, vocab.special_unk_id },
-            { LLM_KV_TOKENIZER_SEP_ID, vocab.special_sep_id },
-            { LLM_KV_TOKENIZER_PAD_ID, vocab.special_pad_id },
+            { LLM_KV_TOKENIZER_BOS_ID,    vocab.special_bos_id    },
+            { LLM_KV_TOKENIZER_EOS_ID,    vocab.special_eos_id    },
+            { LLM_KV_TOKENIZER_UNK_ID,    vocab.special_unk_id    },
+            { LLM_KV_TOKENIZER_SEP_ID,    vocab.special_sep_id    },
+            { LLM_KV_TOKENIZER_PAD_ID,    vocab.special_pad_id    },
+            { LLM_KV_TOKENIZER_CLS_ID,    vocab.special_cls_id    },
+            { LLM_KV_TOKENIZER_MASK_ID,   vocab.special_mask_id   },
+            { LLM_KV_TOKENIZER_PREFIX_ID, vocab.special_prefix_id },
+            { LLM_KV_TOKENIZER_SUFFIX_ID, vocab.special_suffix_id },
+            { LLM_KV_TOKENIZER_MIDDLE_ID, vocab.special_middle_id },
+            { LLM_KV_TOKENIZER_EOT_ID,    vocab.special_eot_id    },
         };
+
         for (const auto & it : special_token_types) {
             const std::string & key = kv(std::get<0>(it));
             int32_t & id = std::get<1>(it);
@@ -4034,7 +4806,6 @@ static void llm_load_vocab(
             } else {
                 id = new_id;
             }
-
         }
 
         // Handle add_bos_token and add_eos_token
@@ -4048,100 +4819,115 @@ static void llm_load_vocab(
                 vocab.special_add_eos = int(temp);
             }
         }
+
+        // find EOT token: "<|eot_id|>", "<|im_end|>", "<end_of_turn>", etc.
+        //
+        // TODO: convert scripts should provide this token through the KV metadata LLAMA_KV_TOKENIZER_EOT_ID
+        //       for now, we apply this workaround to find the EOT token based on its text
+        if (vocab.special_eot_id == -1) {
+            for (const auto & t : vocab.token_to_id) {
+                if (
+                        // TODO: gemma "<end_of_turn>" is exported as a normal token, so the following check does not work
+                        //       need to fix convert script
+                        //vocab.id_to_token[t.second].type == LLAMA_TOKEN_TYPE_CONTROL &&
+                        (t.first == "<|eot_id|>" ||
+                         t.first == "<|im_end|>" ||
+                         t.first == "<|end|>" ||
+                         t.first == "<end_of_turn>" ||
+                         t.first == "<|endoftext|>"
+                        )
+                   ) {
+                    vocab.special_eot_id = t.second;
+                    break;
+                }
+            }
+        }
     }
 
     // build special tokens cache
     {
-        // TODO: It is unclear (to me) at this point, whether special tokes are guaranteed to be of a deterministic type,
-        //  and will always be correctly labeled in 'added_tokens.json' etc.
-        // The assumption is, since special tokens aren't meant to be exposed to end user, they are designed
-        //  to be unmatchable by the tokenizer, therefore tokens from the vocab, which are unmatchable by the tokenizer
-        //  are special tokens.
-        // From testing, this appears to correlate 1:1 with special tokens.
-        //
-
-        // Counting special tokens and verifying in only one direction
-        //  is sufficient to detect difference in those two sets.
-        //
-        uint32_t special_tokens_count_by_type = 0;
-        uint32_t special_tokens_count_from_verification = 0;
-
-        bool special_tokens_definition_mismatch = false;
-
-        for (const auto & t : vocab.token_to_id) {
-            const auto & token = t.first;
-            const auto & id    = t.second;
-
-            // Count all non-normal tokens in the vocab while iterating
-            if (vocab.id_to_token[id].type != LLAMA_TOKEN_TYPE_NORMAL) {
-                special_tokens_count_by_type++;
-            }
-
-            // Skip single character tokens
-            if (token.length() > 1) {
-                bool is_tokenizable = false;
-
-                // Split token string representation in two, in all possible ways
-                //  and check if both halves can be matched to a valid token
-                for (unsigned i = 1; i < token.length();) {
-                    const auto left  = token.substr(0, i);
-                    const auto right = token.substr(i);
-
-                    // check if we didnt partition in the middle of a utf sequence
-                    auto utf = utf8_len(left.at(left.length() - 1));
-
-                    if (utf == 1) {
-                        if (vocab.token_to_id.find(left)  != vocab.token_to_id.end() &&
-                            vocab.token_to_id.find(right) != vocab.token_to_id.end() ) {
-                            is_tokenizable = true;
-                            break;
-                        }
-                        i++;
-                    } else {
-                        // skip over the rest of multibyte utf sequence
-                        i += utf - 1;
-                    }
-                }
-
-                if (!is_tokenizable) {
-                    // Some tokens are multibyte, but they are utf sequences with equivalent text length of 1
-                    //  it's faster to re-filter them here, since there are way less candidates now
-
-                    // Calculate a total "utf" length of a token string representation
-                    size_t utf8_str_len = 0;
-                    for (unsigned i = 0; i < token.length();) {
-                        utf8_str_len++;
-                        i += utf8_len(token.at(i));
-                    }
-
-                    // And skip the ones which are one character
-                    if (utf8_str_len > 1) {
-                        // At this point what we have left are special tokens only
-                        vocab.special_tokens_cache[token] = id;
-
-                        // Count manually found special tokens
-                        special_tokens_count_from_verification++;
-
-                        // If this manually found special token is not marked as such, flag a mismatch
-                        if (vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_NORMAL) {
-                            special_tokens_definition_mismatch = true;
-                        }
-                    }
-                }
+        for (llama_vocab::id id = 0; id < (llama_vocab::id)n_vocab; ++id) {
+            if (!(vocab.id_to_token[id].attr & LLAMA_TOKEN_ATTR_NORMAL)) {
+                vocab.cache_special_tokens.push_back(id);
             }
         }
 
-        if (special_tokens_definition_mismatch || special_tokens_count_from_verification != special_tokens_count_by_type) {
-            LLAMA_LOG_WARN("%s: mismatch in special tokens definition ( %u/%zu vs %u/%zu ).\n",
-                __func__,
-                special_tokens_count_from_verification, vocab.id_to_token.size(),
-                special_tokens_count_by_type, vocab.id_to_token.size()
-            );
-        } else {
-            LLAMA_LOG_INFO("%s: special tokens definition check successful ( %u/%zu ).\n",
-                __func__,
-                special_tokens_count_from_verification, vocab.id_to_token.size()
-            );
+        std::sort( vocab.cache_special_tokens.begin(), vocab.cache_special_tokens.end(),
+            [&] (const llama_vocab::id a, const llama_vocab::id b) {
+                return vocab.id_to_token[a].text.size() > vocab.id_to_token[b].text.size();
+            }
+        );
+
+        LLAMA_LOG_INFO("%s: special tokens cache size = %u\n", __func__, (uint32_t)vocab.cache_special_tokens.size());
+    }
+
+    // build token to piece cache
+    {
+        size_t size_cache = 0;
+
+        std::vector<llama_vocab::token> cache_token_to_piece(n_vocab);
+
+        for (uint32_t id = 0; id < n_vocab; ++id) {
+            cache_token_to_piece[id] = llama_token_to_piece(&model, id, true);
+
+            size_cache += cache_token_to_piece[id].size();
+        }
+
+        std::swap(vocab.cache_token_to_piece, cache_token_to_piece);
+
+        LLAMA_LOG_INFO("%s: token to piece cache size = %.4f MB\n", __func__, size_cache / 1024.0 / 1024.0);
+    }
+
+    // Handle per token attributes
+    //NOTE: Each model customizes per token attributes.
+    //NOTE: Per token attributes are missing from the GGUF file.
+    //TODO: Extract attributes from GGUF file.
+    {
+        auto _contains_any = [] (const std::string &str, const std::vector<std::string> &substrs) -> bool {
+            for (auto substr : substrs) {
+                if (str.find(substr) < std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto _set_tokenid_attr = [&] (const llama_vocab::id id, llama_token_attr attr, bool value) {
+            uint32_t current = vocab.id_to_token.at(id).attr;
+            current = value ? (current | attr) : (current & ~attr);
+            vocab.id_to_token[id].attr = (llama_token_attr) current;
+        };
+
+        auto _set_token_attr = [&] (const std::string & token, llama_token_attr attr, bool value) {
+            _set_tokenid_attr(vocab.token_to_id.at(token), attr, value);
+        };
+
+        std::string model_name;
+        std::string tokenizer_pre;
+
+        ml.get_key(LLM_KV_GENERAL_NAME, model_name, false);
+        ml.get_key(LLM_KV_TOKENIZER_PRE, tokenizer_pre, false);
+
+        // model name to lowercase
+        std::transform(model_name.begin(), model_name.end(), model_name.begin(),
+            [] (const std::string::value_type x) {
+                return std::tolower(x);
+            }
+        );
+
+        // set attributes by model/tokenizer name
+        if (_contains_any(tokenizer_pre, {"jina-v2-es", "jina-v2-de"})) {
+            _set_token_attr("<mask>", LLAMA_TOKEN_ATTR_LSTRIP, true);
+        } else if (_contains_any(model_name, {"phi-3", "phi3"})) {
+            for (auto id : vocab.cache_special_tokens) {
+                _set_tokenid_attr(id, LLAMA_TOKEN_ATTR_RSTRIP, true);
+            }
+            for (auto token : {"</s>"}) {
+                _set_token_attr(token, LLAMA_TOKEN_ATTR_RSTRIP, true);
+            }
+            for (auto token : {"<unk>", "<s>", "<|endoftext|>"}) {
+                _set_token_attr(token, LLAMA_TOKEN_ATTR_RSTRIP, false);
+            }
         }
     }
 }
@@ -4183,7 +4969,7 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
     LLAMA_LOG_INFO("%s: rope scaling     = %s\n",     __func__, rope_scaling_type);
     LLAMA_LOG_INFO("%s: freq_base_train  = %.1f\n",   __func__, hparams.rope_freq_base_train);
     LLAMA_LOG_INFO("%s: freq_scale_train = %g\n",     __func__, hparams.rope_freq_scale_train);
-    LLAMA_LOG_INFO("%s: n_yarn_orig_ctx  = %u\n",     __func__, hparams.n_yarn_orig_ctx);
+    LLAMA_LOG_INFO("%s: n_ctx_orig_yarn  = %u\n",     __func__, hparams.n_ctx_orig_yarn);
     LLAMA_LOG_INFO("%s: rope_finetuned   = %s\n",     __func__, hparams.rope_finetuned ? "yes" : "unknown");
     LLAMA_LOG_INFO("%s: ssm_d_conv       = %u\n",     __func__, hparams.ssm_d_conv);
     LLAMA_LOG_INFO("%s: ssm_d_inner      = %u\n",     __func__, hparams.ssm_d_inner);
@@ -4210,12 +4996,29 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
     LLAMA_LOG_INFO("%s: general.name     = %s\n",    __func__, model.name.c_str());
 
     // special tokens
-    if (vocab.special_bos_id != -1) { LLAMA_LOG_INFO( "%s: BOS token        = %d '%s'\n", __func__, vocab.special_bos_id, vocab.id_to_token[vocab.special_bos_id].text.c_str() ); }
-    if (vocab.special_eos_id != -1) { LLAMA_LOG_INFO( "%s: EOS token        = %d '%s'\n", __func__, vocab.special_eos_id, vocab.id_to_token[vocab.special_eos_id].text.c_str() ); }
-    if (vocab.special_unk_id != -1) { LLAMA_LOG_INFO( "%s: UNK token        = %d '%s'\n", __func__, vocab.special_unk_id, vocab.id_to_token[vocab.special_unk_id].text.c_str() ); }
-    if (vocab.special_sep_id != -1) { LLAMA_LOG_INFO( "%s: SEP token        = %d '%s'\n", __func__, vocab.special_sep_id, vocab.id_to_token[vocab.special_sep_id].text.c_str() ); }
-    if (vocab.special_pad_id != -1) { LLAMA_LOG_INFO( "%s: PAD token        = %d '%s'\n", __func__, vocab.special_pad_id, vocab.id_to_token[vocab.special_pad_id].text.c_str() ); }
-    if (vocab.linefeed_id    != -1) { LLAMA_LOG_INFO( "%s: LF token         = %d '%s'\n", __func__, vocab.linefeed_id,    vocab.id_to_token[vocab.linefeed_id].text.c_str() );    }
+    if (vocab.special_bos_id    != -1) { LLAMA_LOG_INFO( "%s: BOS token        = %d '%s'\n", __func__, vocab.special_bos_id,  vocab.id_to_token[vocab.special_bos_id].text.c_str() );  }
+    if (vocab.special_eos_id    != -1) { LLAMA_LOG_INFO( "%s: EOS token        = %d '%s'\n", __func__, vocab.special_eos_id,  vocab.id_to_token[vocab.special_eos_id].text.c_str() );  }
+    if (vocab.special_unk_id    != -1) { LLAMA_LOG_INFO( "%s: UNK token        = %d '%s'\n", __func__, vocab.special_unk_id,  vocab.id_to_token[vocab.special_unk_id].text.c_str() );  }
+    if (vocab.special_sep_id    != -1) { LLAMA_LOG_INFO( "%s: SEP token        = %d '%s'\n", __func__, vocab.special_sep_id,  vocab.id_to_token[vocab.special_sep_id].text.c_str() );  }
+    if (vocab.special_pad_id    != -1) { LLAMA_LOG_INFO( "%s: PAD token        = %d '%s'\n", __func__, vocab.special_pad_id,  vocab.id_to_token[vocab.special_pad_id].text.c_str() );  }
+    if (vocab.special_cls_id    != -1) { LLAMA_LOG_INFO( "%s: CLS token        = %d '%s'\n", __func__, vocab.special_cls_id,  vocab.id_to_token[vocab.special_cls_id].text.c_str() );  }
+    if (vocab.special_mask_id   != -1) { LLAMA_LOG_INFO( "%s: MASK token       = %d '%s'\n", __func__, vocab.special_mask_id, vocab.id_to_token[vocab.special_mask_id].text.c_str() ); }
+
+    if (vocab.linefeed_id       != -1) { LLAMA_LOG_INFO( "%s: LF token         = %d '%s'\n", __func__, vocab.linefeed_id,       vocab.id_to_token[vocab.linefeed_id].text.c_str() );       }
+    if (vocab.special_prefix_id != -1) { LLAMA_LOG_INFO( "%s: PRE token        = %d '%s'\n", __func__, vocab.special_prefix_id, vocab.id_to_token[vocab.special_prefix_id].text.c_str() ); }
+    if (vocab.special_suffix_id != -1) { LLAMA_LOG_INFO( "%s: SUF token        = %d '%s'\n", __func__, vocab.special_suffix_id, vocab.id_to_token[vocab.special_suffix_id].text.c_str() ); }
+    if (vocab.special_middle_id != -1) { LLAMA_LOG_INFO( "%s: MID token        = %d '%s'\n", __func__, vocab.special_middle_id, vocab.id_to_token[vocab.special_middle_id].text.c_str() ); }
+    if (vocab.special_eot_id    != -1) { LLAMA_LOG_INFO( "%s: EOT token        = %d '%s'\n", __func__, vocab.special_eot_id,    vocab.id_to_token[vocab.special_eot_id].text.c_str() );    }
+
+    if (model.arch == LLM_ARCH_DEEPSEEK2) {
+        LLAMA_LOG_INFO("%s: n_layer_dense_lead   = %d\n",     __func__, hparams.n_layer_dense_lead);
+        LLAMA_LOG_INFO("%s: n_lora_q             = %d\n",     __func__, hparams.n_lora_q);
+        LLAMA_LOG_INFO("%s: n_lora_kv            = %d\n",     __func__, hparams.n_lora_kv);
+        LLAMA_LOG_INFO("%s: n_ff_exp             = %d\n",     __func__, hparams.n_ff_exp);
+        LLAMA_LOG_INFO("%s: n_expert_shared      = %d\n",     __func__, hparams.n_expert_shared);
+        LLAMA_LOG_INFO("%s: expert_weights_scale = %.1f\n",   __func__, hparams.expert_weights_scale);
+        LLAMA_LOG_INFO("%s: rope_yarn_log_mul    = %.4f\n",   __func__, hparams.rope_yarn_log_mul);
+    }
 }
 
 // Returns false if cancelled by progress_callback
@@ -4233,12 +5036,20 @@ static bool llm_load_tensors(
 
     auto & hparams = model.hparams;
 
+#ifdef GGML_USE_SYCL
+    // disable MoE with SYCL until mul_mat_id is updated
+    if (hparams.n_expert > 0) {
+        n_gpu_layers = 0;
+    }
+#endif
+
     model.split_mode   = split_mode;
     model.main_gpu     = main_gpu;
     model.n_gpu_layers = n_gpu_layers;
 
     const int64_t n_layer     = hparams.n_layer;
     const int64_t i_gpu_start = std::max((int64_t) hparams.n_layer - n_gpu_layers, (int64_t) 0);
+    bool use_mmap_buffer = true;
 
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     model.buft_input = llama_default_buffer_type_cpu(true);
@@ -4253,13 +5064,13 @@ static bool llm_load_tensors(
 
     if (split_mode == LLAMA_SPLIT_MODE_LAYER) {
         // calculate the split points
-        int device_count = llama_get_device_count();
+        int device_count = llama_get_device_count(model);
         bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + device_count, [](float x) { return x == 0.0f; });
         std::vector<float> splits(device_count);
         if (all_zero) {
             // default split, by free memory
             for (int i = 0; i < device_count; ++i) {
-                splits[i] = llama_get_device_memory(i);
+                splits[i] = llama_get_device_memory(model, i);
             }
         } else {
             std::copy(tensor_split, tensor_split + device_count, splits.begin());
@@ -4279,35 +5090,35 @@ static bool llm_load_tensors(
         int act_gpu_layers = std::min(n_gpu_layers, (int)n_layer + 1);
         for (int64_t i = i_gpu_start; i < n_layer; ++i) {
             int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(i - i_gpu_start)/act_gpu_layers) - splits.begin();
-            model.buft_layer[i] = llama_default_buffer_type_offload(layer_gpu);
+            model.buft_layer[i] = llama_default_buffer_type_offload(model, layer_gpu);
         }
         // assign the output layer
         if (n_gpu_layers > n_layer) {
             int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(act_gpu_layers - 1)/act_gpu_layers) - splits.begin();
-            model.buft_output = llama_default_buffer_type_offload(layer_gpu);
+            model.buft_output = llama_default_buffer_type_offload(model, layer_gpu);
         } else {
             model.buft_output = llama_default_buffer_type_cpu(true);
         }
     } else {
         ggml_backend_buffer_type_t split_buft;
         if (split_mode == LLAMA_SPLIT_MODE_ROW) {
-            split_buft = llama_default_buffer_type_split(main_gpu, tensor_split);
+            split_buft = llama_default_buffer_type_split(model, main_gpu, tensor_split);
         } else {
             // LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_LAYER in backends where it is not supported
-            split_buft = llama_default_buffer_type_offload(main_gpu);
+            split_buft = llama_default_buffer_type_offload(model, main_gpu);
         }
         // assign the repeating layers
         for (int64_t i = i_gpu_start; i < n_layer; ++i) {
             model.buft_layer[i] = {
                 split_buft,
-                llama_default_buffer_type_offload(main_gpu)
+                llama_default_buffer_type_offload(model, main_gpu)
             };
         }
         // assign the output layer
         if (n_gpu_layers > n_layer) {
             model.buft_output = {
                 split_buft,
-                llama_default_buffer_type_offload(main_gpu)
+                llama_default_buffer_type_offload(model, main_gpu)
             };
         } else {
             model.buft_output = llama_default_buffer_type_cpu(true);
@@ -4327,6 +5138,10 @@ static bool llm_load_tensors(
 
     // create one context per buffer type
     size_t ctx_size = ggml_tensor_overhead()*(ml.n_tensors + 1); // +1 for models where tok_embd is duplicated as output
+
+    // for moe merged tensors
+    ctx_size += ggml_tensor_overhead()*n_layer*3;
+
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
     for (auto & it : buft_layer_count) {
         struct ggml_init_params params = {
@@ -4347,14 +5162,18 @@ static bool llm_load_tensors(
     // create tensors for the weights
     {
         const int64_t n_embd       = hparams.n_embd;
+        const int64_t n_embd_head  = n_embd / hparams.n_head;
         const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa();
         const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa();
         const int64_t n_embd_gqa   = n_embd_v_gqa;
         const int64_t n_vocab      = hparams.n_vocab;
         const int64_t n_vocab_type = hparams.n_vocab_type;
         const int64_t n_ff         = hparams.n_ff;
+        const int64_t n_expert     = hparams.n_expert;
 
-        GGML_ASSERT(n_embd_gqa == n_embd_k_gqa);
+        if (n_expert > 0 && hparams.n_expert_used == 0) {
+            throw std::runtime_error("model has expert layers but no expert layers are used");
+        }
 
         ggml_context * ctx_input        = ctx_map.at(model.buft_input.buft);
         ggml_context * ctx_output       = ctx_map.at(model.buft_output.buft);
@@ -4375,14 +5194,10 @@ static bool llm_load_tensors(
                     // output
                     {
                         model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-                        if (model.arch != LLM_ARCH_MINICPM){
-                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, false);
-                            // if output is NULL, init from the input tok embed
-                            if (model.output == NULL) {
-                                model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
-                                ml.n_created--; // artificial tensor
-                                ml.size_data += ggml_nbytes(model.output);
-                            }
+                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        // if output is NULL, init from the input tok embed
+                        if (model.output == NULL) {
+                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
                         }
                     }
 
@@ -4400,48 +5215,71 @@ static bool llm_load_tensors(
                         layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
 
                         // optional bias tensors
-                        layer.bq = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     false);
-                        layer.bk = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, false);
-                        layer.bv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, false);
-                        layer.bo = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},     false);
+                        layer.bq = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.bk = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.bv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.bo = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},     llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.ffn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
 
-                        layer.ffn_gate_inp = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd}, false);
-
-                        if (layer.ffn_gate_inp == nullptr) {
-                            GGML_ASSERT(hparams.n_expert      == 0);
-                            GGML_ASSERT(hparams.n_expert_used == 0);
-
+                        if (n_expert == 0) {
                             layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
                             layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
                             layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
-                        } else {
-                            GGML_ASSERT(hparams.n_expert      > 0);
-                            GGML_ASSERT(hparams.n_expert_used > 0);
 
-                            // MoE branch
-                            for (uint32_t x = 0; x < hparams.n_expert; ++x) {
-                                layer.ffn_gate_exp[x] = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXP, "weight", i, x), {n_embd,   n_ff});
-                                layer.ffn_down_exp[x] = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXP, "weight", i, x), {  n_ff, n_embd});
-                                layer.ffn_up_exp[x]   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXP,   "weight", i, x), {n_embd,   n_ff});
+                            // optional MLP bias
+                            layer.ffn_gate_b = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                            layer.ffn_down_b = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "bias", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                            layer.ffn_up_b   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        } else {
+                            layer.ffn_gate_inp = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert});
+
+                            layer.ffn_gate_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                            if (layer.ffn_gate_exps) {
+                                layer.ffn_down_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert});
+                                layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert});
+                            } else {
+                                // merge split expert into a single tensor for compatibility with older models
+                                // requires disabling mmap
+                                use_mmap_buffer = false;
+
+                                ggml_type type_gate = ml.require_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXP, "weight", i, 0).c_str())->type;
+                                ggml_type type_down = ml.require_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXP, "weight", i, 0).c_str())->type;
+                                ggml_type type_up   = ml.require_tensor_meta(tn(LLM_TENSOR_FFN_UP_EXP,   "weight", i, 0).c_str())->type;
+
+                                layer.ffn_gate_exps = ggml_new_tensor_3d(ctx_split, type_gate, n_embd,   n_ff, n_expert);
+                                layer.ffn_down_exps = ggml_new_tensor_3d(ctx_split, type_down,   n_ff, n_embd, n_expert);
+                                layer.ffn_up_exps   = ggml_new_tensor_3d(ctx_split, type_up,   n_embd,   n_ff, n_expert);
+
+                                ggml_set_name(layer.ffn_gate_exps, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i).c_str());
+                                ggml_set_name(layer.ffn_down_exps, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i).c_str());
+                                ggml_set_name(layer.ffn_up_exps,   tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i).c_str());
+
+                                for (uint32_t x = 0; x < n_expert; ++x) {
+                                    // the individual experts are loaded into a view of the merged tensor
+                                    ml.create_tensor_as_view(ctx_split, layer.ffn_gate_exps, tn(LLM_TENSOR_FFN_GATE_EXP, "weight", i, x), { n_embd, n_ff }, layer.ffn_gate_exps->nb[2]*x);
+                                    ml.create_tensor_as_view(ctx_split, layer.ffn_down_exps, tn(LLM_TENSOR_FFN_DOWN_EXP, "weight", i, x), { n_ff, n_embd }, layer.ffn_down_exps->nb[2]*x);
+                                    ml.create_tensor_as_view(ctx_split, layer.ffn_up_exps,   tn(LLM_TENSOR_FFN_UP_EXP,   "weight", i, x), { n_embd, n_ff }, layer.ffn_up_exps->nb[2]*x);
+                                }
                             }
                         }
                     }
                 } break;
             case LLM_ARCH_GROK:
                 {
+                    if (n_expert == 0) {
+                        throw std::runtime_error("Grok model cannot have zero experts");
+                    }
+
                     model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
 
                     // output
                     {
                         model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-                        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, false);
+                        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
                         // if output is NULL, init from the input tok embed
                         if (model.output == NULL) {
-                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
-                            ml.n_created--; // artificial tensor
-                            ml.size_data += ggml_nbytes(model.output);
+                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
                         }
                     }
 
@@ -4462,21 +5300,73 @@ static bool llm_load_tensors(
 
                         layer.ffn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
 
-                        layer.ffn_gate_inp = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd});
+                        layer.ffn_gate_inp = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert});
 
-                        GGML_ASSERT(hparams.n_expert      > 0);
-                        GGML_ASSERT(hparams.n_expert_used > 0);
+                        layer.ffn_gate_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff, n_expert}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        if (layer.ffn_gate_exps) {
+                            layer.ffn_down_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert});
+                            layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert});
+                        } else {
+                            // merge split expert into a single tensor for compatibility with older models
+                            // requires disabling mmap
+                            use_mmap_buffer = false;
 
-                        // MoE branch
-                        for (uint32_t x = 0; x < hparams.n_expert; ++x) {
-                            layer.ffn_gate_exp[x] = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXP, "weight", i, x), {n_embd,   n_ff});
-                            layer.ffn_down_exp[x] = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXP, "weight", i, x), {  n_ff, n_embd});
-                            layer.ffn_up_exp[x]   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXP,   "weight", i, x), {n_embd,   n_ff});
+                            ggml_type type_gate = ml.require_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXP, "weight", i, 0).c_str())->type;
+                            ggml_type type_down = ml.require_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXP, "weight", i, 0).c_str())->type;
+                            ggml_type type_up   = ml.require_tensor_meta(tn(LLM_TENSOR_FFN_UP_EXP,   "weight", i, 0).c_str())->type;
+
+                            layer.ffn_gate_exps = ggml_new_tensor_3d(ctx_split, type_gate, n_embd,   n_ff, n_expert);
+                            layer.ffn_down_exps = ggml_new_tensor_3d(ctx_split, type_down,   n_ff, n_embd, n_expert);
+                            layer.ffn_up_exps   = ggml_new_tensor_3d(ctx_split, type_up,   n_embd,   n_ff, n_expert);
+
+                            ggml_set_name(layer.ffn_gate_exps, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i).c_str());
+                            ggml_set_name(layer.ffn_down_exps, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i).c_str());
+                            ggml_set_name(layer.ffn_up_exps,   tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i).c_str());
+
+                            for (uint32_t x = 0; x < n_expert; ++x) {
+                                // the individual experts are loaded into a view of the merged tensor
+                                ml.create_tensor_as_view(ctx_split, layer.ffn_gate_exps, tn(LLM_TENSOR_FFN_GATE_EXP, "weight", i, x), { n_embd, n_ff }, layer.ffn_gate_exps->nb[2]*x);
+                                ml.create_tensor_as_view(ctx_split, layer.ffn_down_exps, tn(LLM_TENSOR_FFN_DOWN_EXP, "weight", i, x), { n_ff, n_embd }, layer.ffn_down_exps->nb[2]*x);
+                                ml.create_tensor_as_view(ctx_split, layer.ffn_up_exps,   tn(LLM_TENSOR_FFN_UP_EXP,   "weight", i, x), { n_embd, n_ff }, layer.ffn_up_exps->nb[2]*x);
+                            }
                         }
 
                         layer.layer_out_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_LAYER_OUT_NORM, "weight", i), {n_embd});
                     }
                 } break;
+            case LLM_ARCH_DBRX:
+            {
+                if (n_expert == 0) {
+                    throw std::runtime_error("DBRX model cannot have zero experts");
+                }
+
+                model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+                // output
+                {
+                    model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+                    model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
+                }
+
+                for (int i = 0; i < n_layer; ++i) {
+                    ggml_context * ctx_layer = ctx_for_layer(i);
+                    ggml_context * ctx_split = ctx_for_layer_split(i);
+
+                    auto & layer = model.layers[i];
+
+                    layer.attn_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,  "weight", i), {n_embd});
+
+                    layer.wqkv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_embd + 2*n_embd_gqa});
+                    layer.wo   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
+
+                    layer.attn_out_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT_NORM, "weight", i), {n_embd});
+
+                    layer.ffn_gate_inp  = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert});
+                    layer.ffn_gate_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff,   n_expert});
+                    layer.ffn_down_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff,   n_embd, n_expert});
+                    layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert});
+                }
+            } break;
             case LLM_ARCH_BAICHUAN:
                 {
                     model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
@@ -4514,11 +5404,9 @@ static bool llm_load_tensors(
                         model.output_norm   = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
                         model.output_norm_b = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd});
 
-                        model.output        = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, false);
+                        model.output        = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
                         if (!model.output) {
-                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}); // needs to be on GPU
-                            ml.n_created--; // artificial tensor
-                            ml.size_data += ggml_nbytes(model.output);
+                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED); // needs to be on GPU
                         }
                     }
 
@@ -4531,8 +5419,8 @@ static bool llm_load_tensors(
                         layer.attn_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
                         layer.attn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "bias", i),   {n_embd});
 
-                        layer.attn_norm_2   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM_2, "weight", i), {n_embd}, false);
-                        layer.attn_norm_2_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM_2, "bias", i),   {n_embd}, false);
+                        layer.attn_norm_2   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM_2, "weight", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_norm_2_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM_2, "bias", i),   {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.wqkv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_embd + 2*n_embd_gqa});
                         layer.wo   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
@@ -4550,7 +5438,12 @@ static bool llm_load_tensors(
                     {
                         model.output_norm   = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
                         model.output_norm_b = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd});
-                        model.output        = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
+                        model.output        = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        if (!model.output) {
+                            // needs to be on GPU
+                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+                        }
+
                     }
 
                     for (int i = 0; i < n_layer; ++i) {
@@ -4576,47 +5469,6 @@ static bool llm_load_tensors(
 
                         layer.ffn_up     = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP, "weight", i),   {n_embd, n_ff});
                         layer.ffn_up_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP, "bias", i),     {n_ff});
-                    }
-                } break;
-            case LLM_ARCH_PERSIMMON:
-                {
-                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"),  {n_embd, n_vocab});
-
-                    {
-                        model.output_norm    = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-                        model.output_norm_b  = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd});
-                        model.output         = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
-                    }
-
-                    for (int i = 0; i < n_layer; ++i) {
-                        ggml_context * ctx_layer = ctx_for_layer(i);
-                        ggml_context * ctx_split = ctx_for_layer_split(i);
-
-                        auto & layer = model.layers[i];
-
-                        layer.attn_norm     = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,   "weight", i), {n_embd});
-                        layer.attn_norm_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,   "bias",   i), {n_embd});
-
-                        layer.wqkv          = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV,    "weight", i), {n_embd, n_embd + 2*n_embd_gqa});
-                        layer.bqkv          = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_QKV,    "bias",   i), {n_embd + 2*n_embd_gqa});
-
-                        layer.wo            = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT,    "weight", i), {n_embd, n_embd});
-                        layer.bo            = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT,    "bias",   i), {n_embd});
-
-                        layer.ffn_down      = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN,    "weight", i), {n_ff, n_embd});
-                        layer.ffn_down_b    = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN,    "bias",   i), {n_embd});
-
-                        layer.ffn_up        = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,      "weight", i), {n_embd, n_ff});
-                        layer.ffn_up_b      = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP,      "bias",   i), {n_ff});
-
-                        layer.ffn_norm      = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM,    "weight", i), {n_embd});
-                        layer.ffn_norm_b    = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM,    "bias",   i), {n_embd});
-
-                        layer.attn_q_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {64});
-                        layer.attn_q_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "bias",   i), {64});
-
-                        layer.attn_k_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {64});
-                        layer.attn_k_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "bias",   i), {64});
                     }
                 } break;
             case LLM_ARCH_BERT:
@@ -4664,11 +5516,58 @@ static bool llm_load_tensors(
 
                             layer.ffn_down_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN, "bias", i),   {n_embd});
                         } else {
-                            layer.ffn_gate   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
+                            layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff});
                         }
 
                         layer.layer_out_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_LAYER_OUT_NORM, "weight", i), {n_embd});
                         layer.layer_out_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_LAYER_OUT_NORM, "bias", i),   {n_embd});
+                    }
+                } break;
+            case LLM_ARCH_JINA_BERT_V2:
+                {
+                    model.tok_embd     = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}); // word_embeddings
+                    model.type_embd    = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_TYPES, "weight"), {n_embd, n_vocab_type}); //token_type_embeddings
+                    model.tok_norm   = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD_NORM, "weight"), {n_embd}); // LayerNorm
+                    model.tok_norm_b = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD_NORM, "bias"),   {n_embd}); //LayerNorm bias
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        ggml_context * ctx_layer = ctx_for_layer(i);
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+                        auto & layer = model.layers[i]; // JinaBertLayer
+
+                        layer.wq   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd});
+                        layer.bq   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i),   {n_embd});
+
+                        layer.attn_q_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_q_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "bias", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+
+                        layer.wk   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.bk   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i),   {n_embd_gqa});
+
+                        layer.attn_k_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_k_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "bias", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+
+                        layer.wv   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.bv   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i),   {n_embd_gqa});
+
+                        layer.wo              = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT,      "weight", i), {n_embd, n_embd}); //output_dens
+                        layer.bo              = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT,      "bias", i), {n_embd}); //output_dens
+
+                        layer.attn_out_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT_NORM, "weight", i), {n_embd}); //output_norm
+                        layer.attn_out_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT_NORM, "bias", i),   {n_embd});
+
+                        layer.attn_norm_2   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM_2, "weight", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_norm_2_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM_2, "bias", i),   {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+
+                        layer.ffn_up = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,        "weight", i), {n_embd, n_ff});
+                        layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE,    "weight", i), {n_embd, n_ff});
+
+                        layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN,        "weight", i), {n_ff, n_embd});
+                        layer.ffn_down_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN,      "bias", i), {n_embd});
+
+                        layer.layer_out_norm = ml.create_tensor(ctx_split, tn(LLM_TENSOR_LAYER_OUT_NORM,        "weight", i), {n_embd});
+                        layer.layer_out_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_LAYER_OUT_NORM,        "bias", i), {n_embd});
                     }
                 } break;
             case LLM_ARCH_BLOOM:
@@ -4712,17 +5611,16 @@ static bool llm_load_tensors(
             case LLM_ARCH_MPT:
                 {
                     model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+                    model.pos_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_POS_EMBD,   "weight"), {n_embd, hparams.n_ctx_train}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                     // output
                     {
                         model.output_norm   = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-                        model.output_norm_b = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd}, false);
+                        model.output_norm_b = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
-                        model.output        = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, false);
+                        model.output        = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
                         if (!model.output) {
-                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}); // needs to be on GPU
-                            ml.n_created--; // artificial tensor
-                            ml.size_data += ggml_nbytes(model.output);
+                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED); // needs to be on GPU
                         }
                     }
 
@@ -4733,25 +5631,31 @@ static bool llm_load_tensors(
                         auto & layer = model.layers[i];
 
                         layer.attn_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
-                        layer.attn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "bias", i),   {n_embd}, false);
+                        layer.attn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "bias", i),   {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.wqkv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_embd + 2*n_embd_gqa});
-                        layer.bqkv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_QKV, "bias", i),   {n_embd + 2*n_embd_gqa}, false);
+                        layer.bqkv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_QKV, "bias", i),   {n_embd + 2*n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.wo   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
-                        layer.bo   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "bias", i),   {n_embd}, false);
+                        layer.bo   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "bias", i),   {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.ffn_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
-                        layer.ffn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "bias", i),   {n_embd}, false);
+                        layer.ffn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "bias", i),   {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.ffn_down   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd});
-                        layer.ffn_down_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN, "bias", i),   {n_embd}, false);
+                        layer.ffn_down_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN, "bias", i),   {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.ffn_up     = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
-                        layer.ffn_up_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP,   "bias", i),   {n_ff}, false);
+                        layer.ffn_up_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP,   "bias", i),   {n_ff}, llama_model_loader::TENSOR_NOT_REQUIRED);
+
+                        layer.attn_q_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_q_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "bias",   i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+
+                        layer.attn_k_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_k_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "bias",   i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         // AWQ ScaleActivation layer
-                        layer.ffn_act = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_ACT, "scales", i), {n_ff}, false);
+                        layer.ffn_act = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_ACT, "scales", i), {n_ff}, llama_model_loader::TENSOR_NOT_REQUIRED);
                     }
                 } break;
             case LLM_ARCH_STABLELM:
@@ -4780,12 +5684,17 @@ static bool llm_load_tensors(
                         layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
 
                         // optional bias tensors, present in Stable LM 2 1.6B
-                        layer.bq = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     false);
-                        layer.bk = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, false);
-                        layer.bv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, false);
+                        layer.bq = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.bk = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.bv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
-                        layer.ffn_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
-                        layer.ffn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "bias", i),   {n_embd});
+                        // optional q and k layernorms, present in StableLM 2 12B
+                        layer.attn_q_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {hparams.n_embd_head_k, hparams.n_head}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_k_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {hparams.n_embd_head_k, hparams.n_head_kv}, llama_model_loader::TENSOR_NOT_REQUIRED);
+
+                        // optional FFN norm, not present in StableLM 2 12B which uses parallel residual
+                        layer.ffn_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.ffn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "bias", i),   {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
                         layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
@@ -4828,7 +5737,11 @@ static bool llm_load_tensors(
                     // output
                     {
                         model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-                        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
+                        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        // if output is NULL, init from the input tok embed
+                        if (model.output == NULL) {
+                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+                        }
                     }
 
                     for (int i = 0; i < n_layer; ++i) {
@@ -4856,6 +5769,54 @@ static bool llm_load_tensors(
                         layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
                     }
                 } break;
+            case LLM_ARCH_QWEN2MOE:
+                {
+                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+                    // output
+                    {
+                        model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+                        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        ggml_context * ctx_layer = ctx_for_layer(i);
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+                        auto & layer = model.layers[i];
+
+                        layer.attn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+
+                        layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd});
+                        layer.wk = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.wv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
+
+                        // optional bias tensors
+                        layer.bq = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd});
+                        layer.bk = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa});
+                        layer.bv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa});
+
+                        layer.ffn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+
+                        layer.ffn_gate_inp = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert});
+
+                        GGML_ASSERT(hparams.n_expert      > 0);
+                        GGML_ASSERT(hparams.n_expert_used > 0);
+
+                        // MoE branch
+                        auto n_ff_exp = n_ff / hparams.n_expert_used;
+                        layer.ffn_gate_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert});
+                        layer.ffn_down_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert});
+                        layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert});
+
+                        // Shared expert branch
+                        layer.ffn_gate_inp_shexp = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i), {n_embd});
+                        layer.ffn_gate_shexp = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff});
+                        layer.ffn_down_shexp = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {  n_ff, n_embd});
+                        layer.ffn_up_shexp   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,   n_ff});
+                    }
+                } break;
             case LLM_ARCH_PHI2:
                 {
                     model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
@@ -4877,8 +5838,8 @@ static bool llm_load_tensors(
                         layer.attn_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
                         layer.attn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "bias", i),   {n_embd});
 
-                        layer.wqkv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_embd + 2*n_embd_gqa}, false);
-                        layer.bqkv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_QKV, "bias", i),   {n_embd + 2*n_embd_gqa}, false);
+                        layer.wqkv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_embd + 2*n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.bqkv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_QKV, "bias", i),   {n_embd + 2*n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         if (layer.wqkv == nullptr) {
                             layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_embd});
@@ -4899,6 +5860,36 @@ static bool llm_load_tensors(
 
                         layer.ffn_up     = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff});
                         layer.ffn_up_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP,   "bias", i),   {n_ff});
+                    }
+                } break;
+            case LLM_ARCH_PHI3:
+                {
+                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab });
+
+                    // output
+                    {
+                        model.output_norm = ml.create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd });
+                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab });
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        ggml_context* ctx_layer = ctx_for_layer(i);
+                        ggml_context* ctx_split = ctx_for_layer_split(i);
+
+                        auto & layer = model.layers[i];
+
+                        layer.attn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd });
+
+                        layer.wqkv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i), { n_embd, n_embd + 2 * n_embd_gqa }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.wo   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd, n_embd });
+
+                        layer.ffn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd });
+
+                        layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd });
+                        layer.ffn_up = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP, "weight", i), { n_embd, 2 * n_ff });
+
+                        layer.rope_long  = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ROPE_FACTORS_LONG,  "weight"), { n_embd_head/2 }, llama_model_loader::TENSOR_NOT_REQUIRED | (i != 0 ? llama_model_loader::TENSOR_DUPLICATED : 0));
+                        layer.rope_short = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ROPE_FACTORS_SHORT, "weight"), { n_embd_head/2 }, llama_model_loader::TENSOR_NOT_REQUIRED | (i != 0 ? llama_model_loader::TENSOR_DUPLICATED : 0));
                     }
                 } break;
             case LLM_ARCH_PLAMO:
@@ -5067,9 +6058,7 @@ static bool llm_load_tensors(
 
                     // output
                     model.output_norm = ml.create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-                    model.output      = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}); // same as tok_embd, duplicated to allow offloading
-                    ml.n_created--; // artificial tensor
-                    ml.size_data += ggml_nbytes(model.output);
+                    model.output      = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED); // same as tok_embd, duplicated to allow offloading
 
                     const int64_t n_ff          = hparams.n_ff;
                     const int64_t n_embd_head_k = hparams.n_embd_head_k;
@@ -5104,12 +6093,10 @@ static bool llm_load_tensors(
                         model.output_norm   = ml.create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
                         model.output_norm_b = ml.create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd});
 
-                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, false);
+                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
                         // if output is NULL, init from the input tok embed
                         if (model.output == NULL) {
-                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
-                            ml.n_created--; // artificial tensor
-                            ml.size_data += ggml_nbytes(model.output);
+                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
                         }
 
                     }
@@ -5160,12 +6147,10 @@ static bool llm_load_tensors(
                     {
                         model.output_norm = ml.create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
 
-                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, false);
+                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
                         // if output is NULL, init from the input tok embed, duplicated to allow offloading
                         if (model.output == NULL) {
-                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
-                            ml.n_created--; // artificial tensor
-                            ml.size_data += ggml_nbytes(model.output);
+                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
                         }
                     }
 
@@ -5196,6 +6181,28 @@ static bool llm_load_tensors(
                         layer.ssm_out = ml.create_tensor(ctx_split, tn(LLM_TENSOR_SSM_OUT, "weight", i), {d_inner, n_embd});
                     }
                 } break;
+            case LLM_ARCH_XVERSE:
+                {
+                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+                    {
+                        model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+                        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
+                    }
+                    for (int i = 0; i < n_layer; ++i) {
+                        ggml_context * ctx_layer = ctx_for_layer(i);
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
+                        auto & layer = model.layers[i];
+                        layer.attn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+                        layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd});
+                        layer.wk = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.wv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
+                        layer.ffn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+                        layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
+                        layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
+                        layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
+                    }
+                } break;
             case LLM_ARCH_COMMAND_R:
                 {
                     model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
@@ -5204,9 +6211,108 @@ static bool llm_load_tensors(
                     {
                         model.output_norm = ml.create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
                         // init output from the input tok embed
-                        model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
-                        ml.n_created--; // artificial tensor
-                        ml.size_data += ggml_nbytes(model.output);
+                        model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        ggml_context * ctx_layer = ctx_for_layer(i);
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+                        auto & layer = model.layers[i];
+
+                        layer.attn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+
+                        if (n_layer >= 64){
+                            layer.attn_q_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {hparams.n_embd_head_k, hparams.n_head});
+                            layer.attn_k_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {hparams.n_embd_head_k, hparams.n_head_kv});
+                        }
+
+                        layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd});
+                        layer.wk = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.wv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
+
+                        layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
+                        layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
+                        layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
+                    }
+                } break;
+            case LLM_ARCH_OLMO:  // adapted from LLM_ARCH_LLAMA with norm params removed
+                {
+                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+                    // output
+                    {
+                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        // if output is NULL, init from the input tok embed
+                        if (model.output == NULL) {
+                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+                        }
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+                        auto & layer = model.layers[i];
+
+                        layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd});
+                        layer.wk = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.wv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa});
+                        layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
+
+
+                        layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
+                        layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
+                        layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
+                    }
+                } break;
+            case LLM_ARCH_GPTNEOX:
+                {
+                    model.tok_embd   = ml.create_tensor(ctx_input,  tn(LLM_TENSOR_TOKEN_EMBD,      "weight"), {n_embd, n_vocab});
+                    // output
+                    {
+                        model.output_norm   = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+                        model.output_norm_b = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "bias"),   {n_embd});
+                        model.output        = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        ggml_context * ctx_layer = ctx_for_layer(i);
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+                        auto & layer = model.layers[i];
+
+                        layer.attn_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+                        layer.attn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "bias", i),   {n_embd});
+
+                        layer.wqkv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_embd + 2*n_embd_gqa});
+                        layer.bqkv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_QKV, "bias", i),   {n_embd + 2*n_embd_gqa});
+
+                        layer.wo   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
+                        layer.bo   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "bias", i),   {n_embd});
+
+                        layer.ffn_norm   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+                        layer.ffn_norm_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "bias", i),   {n_embd});
+
+                        layer.ffn_down   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd});
+                        layer.ffn_down_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN, "bias", i),   {n_embd});
+
+                        layer.ffn_up     = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff});
+                        layer.ffn_up_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP,   "bias", i),   {n_ff});
+                    }
+                } break;
+            case LLM_ARCH_ARCTIC:
+                {
+                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+                    // output
+                    {
+                        model.output_norm = ml.create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        // if output is NULL, init from the input tok embed
+                        if (model.output == NULL) {
+                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+                        }
                     }
 
                     for (int i = 0; i < n_layer; ++i) {
@@ -5222,9 +6328,81 @@ static bool llm_load_tensors(
                         layer.wv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa});
                         layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
 
-                        layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
-                        layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
-                        layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
+                        layer.ffn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+
+                        layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_embd});
+                        layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_embd, n_embd});
+                        layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_embd});
+
+                        layer.ffn_gate_inp = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert});
+                        layer.ffn_norm_exps = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM_EXPS, "weight", i), {n_embd});
+                        layer.ffn_gate_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, false);
+                        layer.ffn_down_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert});
+                        layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert});
+                    }
+                } break;
+            case LLM_ARCH_DEEPSEEK2:
+                {
+                    bool is_lite = (hparams.n_layer == 27);
+
+                    const uint32_t n_embd_head_qk_rope = hparams.n_rot;
+                    const uint32_t n_embd_head_qk_nope = hparams.n_embd_head_k - hparams.n_rot;
+                    const uint32_t q_lora_rank = hparams.n_lora_q;
+                    const uint32_t kv_lora_rank = hparams.n_lora_kv;
+                    const uint32_t n_ff_exp = hparams.n_ff_exp;
+
+                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+                    // output
+                    {
+                        model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+                        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        ggml_context * ctx_layer = ctx_for_layer(i);
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+                        auto & layer = model.layers[i];
+
+                        layer.attn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+                        if (!is_lite) {
+                            layer.attn_q_a_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank});
+                        }
+                        layer.attn_kv_a_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank});
+
+                        if (!is_lite) {
+                            layer.wq_a = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_A,   "weight", i), {n_embd, q_lora_rank});
+                            layer.wq_b = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_B,   "weight", i), {q_lora_rank, hparams.n_head * hparams.n_embd_head_k});
+                        } else {
+                            layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_k_gqa});
+                        }
+                        layer.wkv_a_mqa = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_KV_A_MQA,   "weight", i), {n_embd, kv_lora_rank + n_embd_head_qk_rope});
+                        layer.wkv_b = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_KV_B,   "weight", i), {kv_lora_rank, hparams.n_head * (n_embd_head_qk_nope + hparams.n_embd_head_v)});
+                        layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {hparams.n_head * hparams.n_embd_head_v, n_embd});
+
+                        layer.ffn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+
+                        if ((uint32_t) i < hparams.n_layer_dense_lead) {
+                            layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
+                            layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
+                            layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
+                        } else {
+                            layer.ffn_gate_inp = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert});
+
+                            GGML_ASSERT(hparams.n_expert      > 0);
+                            GGML_ASSERT(hparams.n_expert_used > 0);
+
+                            // MoE branch
+                            layer.ffn_gate_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert});
+                            layer.ffn_down_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert});
+                            layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert});
+
+                            // Shared expert branch
+                            layer.ffn_gate_shexp = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * hparams.n_expert_shared});
+                            layer.ffn_down_shexp = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {  n_ff_exp * hparams.n_expert_shared, n_embd});
+                            layer.ffn_up_shexp   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,   n_ff_exp * hparams.n_expert_shared});
+                        }
                     }
                 } break;
             default:
@@ -5234,7 +6412,7 @@ static bool llm_load_tensors(
 
     ml.done_getting_tensors();
 
-    ml.init_mappings(true, &model.mlock_mmaps);
+    ml.init_mappings(true, use_mlock ? &model.mlock_mmaps : nullptr);
     model.mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -5255,7 +6433,7 @@ static bool llm_load_tensors(
         // only the mmap region containing the tensors in the model is mapped to the backend buffer
         // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer, then we could just use metal for all layers
         // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
-        if (ml.use_mmap && buft == llama_default_buffer_type_cpu(true)) {
+        if (ml.use_mmap && use_mmap_buffer && buft == llama_default_buffer_type_cpu(true)) {
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 void * addr = nullptr;
                 size_t first, last;
@@ -5269,7 +6447,7 @@ static bool llm_load_tensors(
                 }
                 model.bufs.push_back(buf);
                 bufs.emplace(idx, buf);
-#ifdef GGML_USE_CUBLAS
+#ifdef GGML_USE_CUDA
                 if (n_layer >= n_gpu_layers) {
                     ggml_backend_cuda_register_host_buffer(
                         ggml_backend_buffer_get_base(buf),
@@ -5279,7 +6457,7 @@ static bool llm_load_tensors(
             }
         }
 #ifdef GGML_USE_METAL
-        else if (ml.use_mmap && buft == ggml_backend_metal_buffer_type()) {
+        else if (ml.use_mmap && use_mmap_buffer && buft == ggml_backend_metal_buffer_type()) {
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 void * addr = nullptr;
@@ -5362,8 +6540,10 @@ static bool llm_load_tensors(
         }
     }
 
-    for (auto & mapping : ml.mappings) {
-        model.mappings.emplace_back(std::move(mapping));
+    if (use_mmap_buffer) {
+        for (auto & mapping : ml.mappings) {
+            model.mappings.emplace_back(std::move(mapping));
+        }
     }
 
     // loading time will be recalculate after the first eval, so
@@ -5375,7 +6555,7 @@ static bool llm_load_tensors(
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static int llama_model_load(const std::string & fname, llama_model & model, llama_model_params & params) {
     try {
-        llama_model_loader ml(fname, params.use_mmap, params.kv_overrides);
+        llama_model_loader ml(fname, params.use_mmap, params.check_tensors, params.kv_overrides);
 
         model.hparams.vocab_only = params.vocab_only;
 
@@ -5413,6 +6593,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             || !(
                 model.ftype == LLAMA_FTYPE_ALL_F32 ||
                 model.ftype == LLAMA_FTYPE_MOSTLY_F16 ||
+                model.ftype == LLAMA_FTYPE_MOSTLY_BF16 ||
                 model.ftype == LLAMA_FTYPE_MOSTLY_Q4_0 ||
                 model.ftype == LLAMA_FTYPE_MOSTLY_Q4_1
             )
@@ -5488,10 +6669,7 @@ static struct ggml_tensor * llm_build_inp_embd(
 
         inpL = ggml_get_rows(ctx, tok_embd, lctx.inp_tokens);
     } else {
-#ifdef GGML_USE_MPI
-        GGML_ASSERT(false && "not implemented");
-#endif
-        lctx.inp_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, batch.n_tokens);
+       lctx.inp_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, batch.n_tokens);
         inpL = lctx.inp_embd;
         ggml_set_input(lctx.inp_embd);
     }
@@ -5504,37 +6682,47 @@ static struct ggml_tensor * llm_build_inp_embd(
 static void llm_build_kv_store(
         struct ggml_context * ctx,
         const llama_hparams & hparams,
+        const llama_cparams & cparams,
        const llama_kv_cache & kv,
          struct ggml_cgraph * graph,
          struct ggml_tensor * k_cur,
          struct ggml_tensor * v_cur,
-                    int64_t   n_ctx,
                     int32_t   n_tokens,
                     int32_t   kv_head,
          const llm_build_cb & cb,
                     int64_t   il) {
+    const int64_t n_ctx = cparams.n_ctx;
+
     const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa();
     const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa();
 
     GGML_ASSERT(kv.size == n_ctx);
 
-    // compute the transposed [n_tokens, n_embd] V matrix
-    struct ggml_tensor * v_cur_t = ggml_transpose(ctx, ggml_reshape_2d(ctx, v_cur, n_embd_v_gqa, n_tokens));
-    //struct ggml_tensor * v_cur_t = ggml_transpose(ctx, v_cur); // TODO: reshape above is likely not needed
-    cb(v_cur_t, "v_cur_t", il);
-
     struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa,
             (ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa))*kv_head);
     cb(k_cache_view, "k_cache_view", il);
 
-    struct ggml_tensor * v_cache_view = ggml_view_2d(ctx, kv.v_l[il], n_tokens, n_embd_v_gqa,
-            (  n_ctx)*ggml_element_size(kv.v_l[il]),
-            (kv_head)*ggml_element_size(kv.v_l[il]));
+    // note: storing RoPE-ed version of K in the KV cache
+    ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur, k_cache_view));
+
+    assert(v_cur->ne[0] == n_embd_v_gqa && v_cur->ne[1] == n_tokens);
+
+    struct ggml_tensor * v_cache_view = nullptr;
+
+    if (cparams.flash_attn) {
+        v_cache_view = ggml_view_1d(ctx, kv.v_l[il], n_tokens*n_embd_v_gqa,
+                (kv_head)*ggml_row_size(kv.v_l[il]->type, n_embd_v_gqa));
+    } else {
+        // note: the V cache is transposed when not using flash attention
+        v_cache_view = ggml_view_2d(ctx, kv.v_l[il], n_tokens, n_embd_v_gqa,
+                (  n_ctx)*ggml_element_size(kv.v_l[il]),
+                (kv_head)*ggml_element_size(kv.v_l[il]));
+
+        v_cur = ggml_transpose(ctx, v_cur);
+    }
     cb(v_cache_view, "v_cache_view", il);
 
-    // important: storing RoPE-ed version of K in the KV cache!
-    ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur,   k_cache_view));
-    ggml_build_forward_expand(graph, ggml_cpy(ctx, v_cur_t, v_cache_view));
+    ggml_build_forward_expand(graph, ggml_cpy(ctx, v_cur, v_cache_view));
 }
 
 static struct ggml_tensor * llm_build_norm(
@@ -5583,7 +6771,7 @@ static struct ggml_tensor * llm_build_ffn(
           llm_ffn_gate_type   type_gate,
          const llm_build_cb & cb,
                         int   il) {
-    struct ggml_tensor * tmp = ggml_mul_mat(ctx, up, cur);
+    struct ggml_tensor * tmp = up ? ggml_mul_mat(ctx, up, cur) : cur;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -5660,29 +6848,129 @@ static struct ggml_tensor * llm_build_ffn(
     return cur;
 }
 
-// if max_alibi_bias > 0 then apply ALiBi
+static struct ggml_tensor * llm_build_moe_ffn(
+        struct ggml_context * ctx,
+         struct ggml_tensor * cur,
+         struct ggml_tensor * gate_inp,
+         struct ggml_tensor * up_exps,
+         struct ggml_tensor * gate_exps,
+         struct ggml_tensor * down_exps,
+                    int64_t   n_expert,
+                    int64_t   n_expert_used,
+            llm_ffn_op_type   type_op,
+                       bool   norm_w,
+                       bool   scale_w,
+                      float   w_scale,
+         const llm_build_cb & cb,
+                        int   il) {
+    int64_t n_embd = cur->ne[0];
+    int64_t n_tokens = cur->ne[1];
+
+    ggml_tensor * logits = ggml_mul_mat(ctx, gate_inp, cur); // [n_expert, n_tokens]
+    cb(logits, "ffn_moe_logits", il);
+
+    ggml_tensor * probs = ggml_soft_max(ctx, logits); // [n_expert, n_tokens]
+    cb(probs, "ffn_moe_probs", il);
+
+    // select experts
+    ggml_tensor * selected_experts = ggml_top_k(ctx, probs, n_expert_used); // [n_expert_used, n_tokens]
+    cb(selected_experts->src[0], "ffn_moe_argsort", il);
+    cb(selected_experts, "ffn_moe_topk", il);
+
+    ggml_tensor * weights = ggml_get_rows(ctx,
+            ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
+    cb(weights, "ffn_moe_weights", il);
+
+    if (norm_w) {
+        weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+
+        ggml_tensor * weights_sum = ggml_sum_rows(ctx, weights); // [1, n_tokens]
+        cb(weights_sum, "ffn_moe_weights_sum", il);
+
+        weights = ggml_div(ctx, weights, weights_sum); // [n_expert_used, n_tokens]
+        cb(weights, "ffn_moe_weights_norm", il);
+
+        weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+    }
+    if (scale_w) {
+        weights = ggml_scale(ctx, weights, w_scale);
+        cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+    ggml_tensor * up = ggml_mul_mat_id(ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+    cb(up, "ffn_moe_up", il);
+
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+    cb(gate, "ffn_moe_gate", il);
+
+    switch (type_op) {
+        case LLM_FFN_SILU:
+            {
+                gate = ggml_silu(ctx, gate);
+                cb(gate, "ffn_moe_silu", il);
+            } break;
+        case LLM_FFN_GELU:
+            {
+                gate = ggml_gelu(ctx, gate);
+                cb(gate, "ffn_moe_gelu", il);
+            } break;
+        default:
+            GGML_ASSERT(false);
+    }
+
+    ggml_tensor * par = ggml_mul(ctx, up, gate); // [n_ff, n_expert_used, n_tokens]
+    cb(par, "ffn_moe_gate_par", il);
+
+    ggml_tensor * experts = ggml_mul_mat_id(ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    cb(experts, "ffn_moe_down", il);
+
+    experts = ggml_mul(ctx, experts, weights);
+
+    // aggregate experts
+    ggml_tensor * moe_out = nullptr;
+    for (int i = 0; i < n_expert_used; ++i) {
+        ggml_tensor * cur_expert = ggml_view_2d(ctx, experts, n_embd, n_tokens,
+                experts->nb[2], i*experts->nb[1]);
+
+        if (i == 0) {
+            moe_out = cur_expert;
+        } else {
+            moe_out = ggml_add(ctx, moe_out, cur_expert);
+        }
+    }
+
+    if (n_expert_used == 1) {
+        // avoid returning a non-contiguous tensor
+        moe_out = ggml_cont(ctx, moe_out);
+    }
+
+    return moe_out;
+}
+
 static struct ggml_tensor * llm_build_kqv(
         struct ggml_context * ctx,
           const llama_model & model,
         const llama_hparams & hparams,
+        const llama_cparams & cparams,
        const llama_kv_cache & kv,
          struct ggml_cgraph * graph,
          struct ggml_tensor * wo,
          struct ggml_tensor * wo_b,
          struct ggml_tensor * q_cur,
          struct ggml_tensor * kq_mask,
-         struct ggml_tensor * kq_pos,
-                    int64_t   n_ctx,
                     int32_t   n_tokens,
                     int32_t   n_kv,
                     float     kq_scale,
          const llm_build_cb & cb,
                     int       il) {
+    const int64_t n_ctx         = cparams.n_ctx;
     const int64_t n_head        = hparams.n_head;
     const int64_t n_head_kv     = hparams.n_head_kv;
     const int64_t n_embd_head_k = hparams.n_embd_head_k;
     const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa();
     const int64_t n_embd_head_v = hparams.n_embd_head_v;
+    const int64_t n_embd_v_gqa  = hparams.n_embd_v_gqa();
 
     struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
     cb(q, "q", il);
@@ -5695,71 +6983,75 @@ static struct ggml_tensor * llm_build_kqv(
                 0);
     cb(k, "k", il);
 
-    struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
-    cb(kq, "kq", il);
+    struct ggml_tensor * cur;
 
-    if (model.arch == LLM_ARCH_PHI2) {
-        // for this arch, we need to perform the KQ multiplication with F32 precision, otherwise we get NaNs
-        // ref: https://github.com/ggerganov/llama.cpp/pull/4490#issuecomment-1859055847
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-    }
+    if (cparams.flash_attn) {
+        GGML_UNUSED(model);
+        GGML_UNUSED(n_ctx);
 
-    if (model.arch == LLM_ARCH_GROK) {
-        // need to do the following:
-        // multiply by attn_output_multiplyer of 0.08838834764831845
-        // and then :
-        // kq = 30 * tanh(kq / 30)
-        // before the softmax below
+        // split cached v into n_head heads (not transposed)
+        struct ggml_tensor * v =
+            ggml_view_3d(ctx, kv.v_l[il],
+                    n_embd_head_v, n_kv, n_head_kv,
+                    ggml_row_size(kv.v_l[il]->type, n_embd_v_gqa),
+                    ggml_row_size(kv.v_l[il]->type, n_embd_head_v),
+                    0);
+        cb(v, "v", il);
 
-        //try from phi2
-        //ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias);
 
-        kq = ggml_tanh(ctx, ggml_scale(ctx, kq, 0.08838834764831845f/30.0f));
-        kq = ggml_scale(ctx, kq, 30);
-    }
+        if (model.arch == LLM_ARCH_PHI2 || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GPTNEOX) {
+            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        }
 
-#if defined(GGML_USE_KOMPUTE)
-#pragma message("TODO: ALiBi support in ggml_soft_max_ext is not implemented for Kompute")
-#pragma message("      Falling back to ggml_alibi(). Will become an error in Mar 2024")
-#pragma message("ref:  https://github.com/ggerganov/llama.cpp/pull/5488")
-    if (hparams.f_max_alibi_bias > 0.0f) {
-        kq = ggml_scale(ctx, kq, kq_scale);
-        cb(kq, "kq_scaled", il);
+        cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
+    } else {
+        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+        cb(kq, "kq", il);
 
-        kq = ggml_alibi(ctx, kq, /*n_past*/ 0, n_head, hparams.f_max_alibi_bias);
-        cb(kq, "kq_scaled_alibi", il);
+        if (model.arch == LLM_ARCH_PHI2 || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GPTNEOX) {
+            // for this arch, we need to perform the KQ multiplication with F32 precision, otherwise we get NaNs
+            // ref: https://github.com/ggerganov/llama.cpp/pull/4490#issuecomment-1859055847
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        }
 
-        kq = ggml_add(ctx, kq, kq_mask);
-        cb(kq, "kq_masked", il);
+        if (model.arch == LLM_ARCH_GROK) {
+            // need to do the following:
+            // multiply by attn_output_multiplyer of 0.08838834764831845
+            // and then :
+            // kq = 30 * tanh(kq / 30)
+            // before the softmax below
 
-        kq = ggml_soft_max(ctx, kq);
-        cb(kq, "kq_soft_max", il);
-    } else
-#endif
-    {
-        kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_pos, kq_scale, hparams.f_max_alibi_bias);
+            //try from phi2
+            //ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+
+            kq = ggml_tanh(ctx, ggml_scale(ctx, kq, 0.08838834764831845f/30.0f));
+            kq = ggml_scale(ctx, kq, 30);
+        }
+
+        kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         cb(kq, "kq_soft_max_ext", il);
+
+        GGML_ASSERT(kv.size == n_ctx);
+
+        // split cached v into n_head heads
+        struct ggml_tensor * v =
+            ggml_view_3d(ctx, kv.v_l[il],
+                    n_kv, n_embd_head_v, n_head_kv,
+                    ggml_element_size(kv.v_l[il])*n_ctx,
+                    ggml_element_size(kv.v_l[il])*n_ctx*n_embd_head_v,
+                    0);
+        cb(v, "v", il);
+
+        struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+        cb(kqv, "kqv", il);
+
+        struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
+        cb(kqv_merged, "kqv_merged", il);
+
+        cur = ggml_cont_2d(ctx, kqv_merged, n_embd_head_v*n_head, n_tokens);
+        cb(cur, "kqv_merged_cont", il);
     }
-
-    GGML_ASSERT(kv.size == n_ctx);
-
-    // split cached v into n_head heads
-    struct ggml_tensor * v =
-        ggml_view_3d(ctx, kv.v_l[il],
-                n_kv, n_embd_head_v, n_head_kv,
-                ggml_element_size(kv.v_l[il])*n_ctx,
-                ggml_element_size(kv.v_l[il])*n_ctx*n_embd_head_v,
-                0);
-    cb(v, "v", il);
-
-    struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
-    cb(kqv, "kqv", il);
-
-    struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
-    cb(kqv_merged, "kqv_merged", il);
-
-    struct ggml_tensor * cur = ggml_cont_2d(ctx, kqv_merged, n_embd_head_k*n_head, n_tokens);
-    cb(cur, "kqv_merged_cont", il);
 
     ggml_build_forward_expand(graph, cur);
 
@@ -5779,6 +7071,7 @@ static struct ggml_tensor * llm_build_kv(
         struct ggml_context * ctx,
           const llama_model & model,
         const llama_hparams & hparams,
+        const llama_cparams & cparams,
        const llama_kv_cache & kv,
          struct ggml_cgraph * graph,
          struct ggml_tensor * wo,
@@ -5787,8 +7080,6 @@ static struct ggml_tensor * llm_build_kv(
          struct ggml_tensor * v_cur,
          struct ggml_tensor * q_cur,
          struct ggml_tensor * kq_mask,
-         struct ggml_tensor * kq_pos,
-                    int64_t   n_ctx,
                     int32_t   n_tokens,
                     int32_t   kv_head,
                     int32_t   n_kv,
@@ -5802,12 +7093,12 @@ static struct ggml_tensor * llm_build_kv(
     ggml_build_forward_expand(graph, k_cur);
     ggml_build_forward_expand(graph, v_cur);
 
-    llm_build_kv_store(ctx, hparams, kv, graph, k_cur, v_cur, n_ctx, n_tokens, kv_head, cb, il);
+    llm_build_kv_store(ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il);
 
     struct ggml_tensor * cur;
 
-    cur  = llm_build_kqv(ctx, model, hparams, kv, graph, wo, wo_b,
-            q_cur, kq_mask, kq_pos, n_ctx, n_tokens, n_kv, kq_scale, cb, il);
+    cur  = llm_build_kqv(ctx, model, hparams, cparams, kv, graph, wo, wo_b,
+            q_cur, kq_mask, n_tokens, n_kv, kq_scale, cb, il);
     cb(cur, "kqv_out", il);
 
     return cur;
@@ -5844,9 +7135,12 @@ struct llm_build_context {
     const float norm_rms_eps;
 
     const int32_t n_tokens;
-    const int32_t n_kv;     // size of KV cache to consider (n_kv <= n_ctx)
+    const int32_t n_kv;     // size of KV cache to consider (n_kv <= kv_self.size)
+    const int32_t n_outputs;
     const int32_t kv_head;  // index of where we store new KV data in the cache
-    const int32_t n_orig_ctx;
+    const int32_t n_ctx_orig;
+
+    const bool flash_attn;
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
@@ -5891,8 +7185,10 @@ struct llm_build_context {
         norm_rms_eps     (hparams.f_norm_rms_eps),
         n_tokens         (batch.n_tokens),
         n_kv             (worst_case ? kv_self.size : kv_self.n),
+        n_outputs        (worst_case ? n_tokens : lctx.n_outputs),
         kv_head          (worst_case ? (kv_self.recurrent ? 0 : kv_self.size - n_tokens) : kv_self.head),
-        n_orig_ctx       (cparams.n_yarn_orig_ctx),
+        n_ctx_orig       (cparams.n_ctx_orig_yarn),
+        flash_attn       (cparams.flash_attn),
         pooling_type     (cparams.pooling_type),
         rope_type        (hparams.rope_type),
         cb               (cb),
@@ -5909,17 +7205,17 @@ struct llm_build_context {
 
         ctx0 = ggml_init(params);
 
-        lctx.inp_tokens = nullptr;
-        lctx.inp_embd = nullptr;
-        lctx.inp_pos = nullptr;
+        lctx.inp_tokens  = nullptr;
+        lctx.inp_embd    = nullptr;
+        lctx.inp_pos     = nullptr;
+        lctx.inp_out_ids = nullptr;
         lctx.inp_KQ_mask = nullptr;
-        lctx.inp_KQ_pos = nullptr;
         lctx.inp_K_shift = nullptr;
-        lctx.inp_mean = nullptr;
-        lctx.inp_cls = nullptr;
-        lctx.inp_s_copy = nullptr;
-        lctx.inp_s_mask = nullptr;
-        lctx.inp_s_seq = nullptr;
+        lctx.inp_mean    = nullptr;
+        lctx.inp_cls     = nullptr;
+        lctx.inp_s_copy  = nullptr;
+        lctx.inp_s_mask  = nullptr;
+        lctx.inp_s_seq   = nullptr;
     }
 
     void free() {
@@ -5938,17 +7234,20 @@ struct llm_build_context {
         cb(lctx.inp_K_shift, "K_shift", -1);
         ggml_set_input(lctx.inp_K_shift);
 
+
         for (int il = 0; il < n_layer; ++il) {
+            struct ggml_tensor * rope_factors = build_rope_factors(il);
             struct ggml_tensor * tmp =
                 // we rotate only the first n_rot dimensions
-                ggml_rope_custom_inplace(ctx0,
+                ggml_rope_ext_inplace(ctx0,
                         ggml_view_3d(ctx0, kv_self.k_l[il],
                             n_embd_head_k, n_head_kv, n_ctx,
                             ggml_row_size(kv_self.k_l[il]->type, n_embd_head_k),
                             ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
                             0),
-                        lctx.inp_K_shift, n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                        lctx.inp_K_shift, rope_factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
+
             cb(tmp, "K_shifted", il);
             ggml_build_forward_expand(gf, tmp);
         }
@@ -6006,15 +7305,31 @@ struct llm_build_context {
                         ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
                         ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*id));
 
-                ggml_tensor * view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
-                        nm, n_embd_v_gqa,
-                        ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                        ggml_row_size(kv_self.v_l[il]->type, i));
+                ggml_tensor * view_v_src;
+                ggml_tensor * view_v_dst;
 
-                ggml_tensor * view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
-                        nm, n_embd_v_gqa,
-                        ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                        ggml_row_size(kv_self.v_l[il]->type, id));
+                if (flash_attn) {
+                    // NOTE: the V cache is not transposed when using flash attention
+                    view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
+                            n_embd_v_gqa, nm,
+                            ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa),
+                            ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa*i));
+
+                    view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
+                            n_embd_v_gqa, nm,
+                            ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa),
+                            ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa*id));
+                } else {
+                    view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
+                            nm, n_embd_v_gqa,
+                            ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
+                            ggml_row_size(kv_self.v_l[il]->type, i));
+
+                    view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
+                            nm, n_embd_v_gqa,
+                            ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
+                            ggml_row_size(kv_self.v_l[il]->type, id));
+                }
 
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
@@ -6035,22 +7350,33 @@ struct llm_build_context {
         return lctx.inp_pos;
     }
 
+    struct ggml_tensor * build_rope_factors(int il) {
+        // choose long/short freq factors based on the context size
+        const auto n_ctx_pre_seq = cparams.n_ctx / cparams.n_seq_max;
+
+        if (n_ctx_pre_seq > hparams.n_ctx_orig_yarn) {
+            return model.layers[il].rope_long;
+        }
+
+        return model.layers[il].rope_short;
+    }
+
+    struct ggml_tensor * build_inp_out_ids() {
+        lctx.inp_out_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+        cb(lctx.inp_out_ids, "inp_out_ids", -1);
+        ggml_set_input(lctx.inp_out_ids);
+        return lctx.inp_out_ids;
+    }
+
     struct ggml_tensor * build_inp_KQ_mask(bool causal = true) {
         if (causal) {
-            lctx.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, n_tokens);
+            lctx.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         } else {
-            lctx.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
+            lctx.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         }
         cb(lctx.inp_KQ_mask, "KQ_mask", -1);
         ggml_set_input(lctx.inp_KQ_mask);
-        return lctx.inp_KQ_mask;
-    }
-
-    struct ggml_tensor * build_inp_KQ_pos() {
-        lctx.inp_KQ_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_kv);
-        cb(lctx.inp_KQ_pos, "KQ_pos", -1);
-        ggml_set_input(lctx.inp_KQ_pos);
-        return lctx.inp_KQ_pos;
+        return flash_attn ? ggml_cast(ctx0, lctx.inp_KQ_mask, GGML_TYPE_F16) : lctx.inp_KQ_mask;
     }
 
     struct ggml_tensor * build_inp_mean() {
@@ -6090,6 +7416,9 @@ struct llm_build_context {
 
     struct ggml_cgraph * build_llama() {
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
 
         const int64_t n_embd_head = hparams.n_embd_head_v;
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
@@ -6139,23 +7468,31 @@ struct llm_build_context {
                     cb(Vcur, "Vcur", il);
                 }
 
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -6169,9 +7506,9 @@ struct llm_build_context {
                 cb(cur, "ffn_norm", il);
 
                 cur = llm_build_ffn(ctx0, cur,
-                        model.layers[il].ffn_up,   NULL,
-                        model.layers[il].ffn_gate, NULL,
-                        model.layers[il].ffn_down, NULL,
+                        model.layers[il].ffn_up,   model.layers[il].ffn_up_b,
+                        model.layers[il].ffn_gate, model.layers[il].ffn_gate_b,
+                        model.layers[il].ffn_down, model.layers[il].ffn_down_b,
                         NULL,
                         LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
                 cb(cur, "ffn_out", il);
@@ -6182,62 +7519,16 @@ struct llm_build_context {
                         LLM_NORM_RMS, cb, il);
                 cb(cur, "ffn_norm", il);
 
-                ggml_tensor * logits = ggml_mul_mat(ctx0, model.layers[il].ffn_gate_inp, cur); // [n_tokens, num_experts]
-                cb(logits, "ffn_moe_logits", il);
-
-                ggml_tensor * probs = ggml_soft_max(ctx0, logits); // [n_tokens, num_experts]
-                cb(probs, "ffn_moe_probs", il);
-
-                // select experts
-                ggml_tensor * selected_experts = ggml_top_k(ctx0, probs, n_expert_used); // [n_tokens, num_experts_per_tok]
-                cb(selected_experts->src[0], "ffn_moe_argsort", il);
-
-                ggml_tensor * weights = ggml_get_rows(ctx0,
-                        ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens), selected_experts);
-                cb(weights, "ffn_moe_weights", il);
-
-                weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens); // [n_tokens, num_experts_per_tok]
-
-                ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
-                cb(weights_sum, "ffn_moe_weights_sum", il);
-
-                weights = ggml_div(ctx0, weights, weights_sum); // [n_tokens, num_experts_per_tok]
-                cb(weights, "ffn_moe_weights_norm", il);
-
-                // compute expert outputs
-                ggml_tensor * moe_out = nullptr;
-
-                for (int i = 0; i < n_expert_used; ++i) {
-                    ggml_tensor * cur_expert;
-
-                    ggml_tensor * cur_up = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_exp, n_expert, selected_experts, i, cur);
-                    cb(cur_up, "ffn_moe_up", il);
-
-                    ggml_tensor * cur_gate = ggml_mul_mat_id(ctx0, model.layers[il].ffn_gate_exp, n_expert, selected_experts, i, cur);
-                    cb(cur_gate, "ffn_moe_gate", il);
-
-                    cur_gate = ggml_silu(ctx0, cur_gate);
-                    cb(cur_gate, "ffn_moe_silu", il);
-
-                    cur_expert = ggml_mul(ctx0, cur_up, cur_gate); // [n_tokens, n_embd]
-                    cb(cur_expert, "ffn_moe_gate_par", il);
-
-                    cur_expert = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exp, n_expert, selected_experts, i, cur_expert); // [n_tokens, n_embd]
-                    cb(cur_expert, "ffn_moe_down", il);
-
-                    cur_expert = ggml_mul(ctx0, cur_expert,
-                            ggml_view_2d(ctx0, weights, 1, n_tokens, weights->nb[1], i*weights->nb[0]));
-                    cb(cur_expert, "ffn_moe_weighted", il);
-
-                    if (i == 0) {
-                        moe_out = cur_expert;
-                    } else {
-                        moe_out = ggml_add(ctx0, moe_out, cur_expert);
-                        cb(moe_out, "ffn_moe_out", il);
-                    }
-                }
-
-                cur = moe_out;
+                cur = llm_build_moe_ffn(ctx0, cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, true,
+                        false, 0.0,
+                        cb, il);
+                cb(cur, "ffn_moe_out", il);
             }
 
             cur = ggml_add(ctx0, cur, ffn_inp);
@@ -6287,9 +7578,6 @@ struct llm_build_context {
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-        // positions of the tokens in the KV cache
-        struct ggml_tensor * KQ_pos = build_inp_KQ_pos();
-
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;
 
@@ -6311,14 +7599,14 @@ struct llm_build_context {
 
                 switch (model.type) {
                     case MODEL_7B:
-                        Qcur = ggml_rope_custom(
-                            ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos,
-                            n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                        Qcur = ggml_rope_ext(
+                            ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                             ext_factor, attn_factor, beta_fast, beta_slow
                         );
-                        Kcur = ggml_rope_custom(
-                            ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                            n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                        Kcur = ggml_rope_ext(
+                            ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                             ext_factor, attn_factor, beta_fast, beta_slow
                         );
                         break;
@@ -6332,9 +7620,16 @@ struct llm_build_context {
                 cb(Qcur, "Qcur", il);
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, KQ_pos, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -6368,6 +7663,108 @@ struct llm_build_context {
         cur = llm_build_norm(ctx0, cur, hparams,
                 model.output_norm, NULL,
                 LLM_NORM_RMS, cb, -1);
+        cb(cur, "result_norm", -1);
+
+        // lm_head
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return gf;
+    }
+
+    struct ggml_cgraph * build_xverse() {
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+        GGML_ASSERT(n_embd_head == hparams.n_rot);
+
+        struct ggml_tensor * cur;
+        struct ggml_tensor * inpL;
+
+        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+        // inp_pos - contains the positions
+        struct ggml_tensor * inp_pos = build_inp_pos();
+
+        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
+        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+
+        for (int il = 0; il < n_layer; ++il) {
+            struct ggml_tensor * inpSA = inpL;
+
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                    model.layers[il].attn_norm, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self-attention
+            {
+                struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+                cb(Qcur, "Qcur", il);
+
+                struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.layers[il].wk, cur);
+                cb(Kcur, "Kcur", il);
+
+                struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Qcur, "Qcur", il);
+
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Kcur, "Kcur", il);
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                        model.layers[il].wo, NULL,
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,      cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            cb(ffn_inp, "ffn_inp", il);
+
+            // feed-forward network
+            {
+                cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                        model.layers[il].ffn_norm, NULL,
+                        LLM_NORM_RMS, cb, il);
+                cb(cur, "ffn_norm", il);
+
+                cur = llm_build_ffn(ctx0, cur,
+                        model.layers[il].ffn_up,   NULL,
+                        model.layers[il].ffn_gate, NULL,
+                        model.layers[il].ffn_down, NULL,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                cb(cur, "ffn_out", il);
+            }
+
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            cb(cur, "l_out", il);
+
+            // input for next layer
+            inpL = cur;
+        }
+
+        cur = inpL;
+
+        cur = llm_build_norm(ctx0, cur, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
         cb(cur, "result_norm", -1);
 
         // lm_head
@@ -6435,21 +7832,29 @@ struct llm_build_context {
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
 
                 // using mode = 2 for neox mode
-                Qcur = ggml_rope_custom(
-                    ctx0, Qcur, inp_pos, n_rot, rope_type, 0, n_orig_ctx,
+                Qcur = ggml_rope_ext(
+                    ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, Kcur, inp_pos, n_rot, rope_type, 0, n_orig_ctx,
+                Kcur = ggml_rope_ext(
+                    ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur       = ggml_get_rows(ctx0,       cur, inp_out_ids);
+                inpL      = ggml_get_rows(ctx0,      inpL, inp_out_ids);
+                attn_norm = ggml_get_rows(ctx0, attn_norm, inp_out_ids);
             }
 
             struct ggml_tensor * ffn_inp = cur;
@@ -6494,6 +7899,9 @@ struct llm_build_context {
 
     struct ggml_cgraph * build_grok() {
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
 
         const int64_t n_embd_head = hparams.n_embd_head_v;
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
@@ -6547,23 +7955,31 @@ struct llm_build_context {
                     cb(Vcur, "Vcur", il);
                 }
 
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f, cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f, cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             // Grok
@@ -6585,63 +8001,16 @@ struct llm_build_context {
                     LLM_NORM_RMS, cb, il);
             cb(cur, "ffn_norm", il);
 
-            ggml_tensor * logits = ggml_mul_mat(ctx0, model.layers[il].ffn_gate_inp, cur); // [n_tokens, num_experts]
-            cb(logits, "ffn_moe_logits", il);
-
-            ggml_tensor * probs = ggml_soft_max(ctx0, logits); // [n_tokens, num_experts]
-            cb(probs, "ffn_moe_probs", il);
-
-            // select experts
-            ggml_tensor * selected_experts = ggml_top_k(ctx0, probs, n_expert_used); // [n_tokens, num_experts_per_tok]
-            cb(selected_experts->src[0], "ffn_moe_argsort", il);
-
-            ggml_tensor * weights = ggml_get_rows(ctx0,
-                    ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens), selected_experts);
-            cb(weights, "ffn_moe_weights", il);
-
-            weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens); // [n_tokens, num_experts_per_tok]
-
-            ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
-            cb(weights_sum, "ffn_moe_weights_sum", il);
-
-            weights = ggml_div(ctx0, weights, weights_sum); // [n_tokens, num_experts_per_tok]
-            cb(weights, "ffn_moe_weights_norm", il);
-
-            // compute expert outputs
-            ggml_tensor * moe_out = nullptr;
-
-            for (int i = 0; i < n_expert_used; ++i) {
-                ggml_tensor * cur_expert;
-
-                ggml_tensor * cur_up = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_exp, n_expert, selected_experts, i, cur);
-                cb(cur_up, "ffn_moe_up", il);
-
-                ggml_tensor * cur_gate = ggml_mul_mat_id(ctx0, model.layers[il].ffn_gate_exp, n_expert, selected_experts, i, cur);
-                cb(cur_gate, "ffn_moe_gate", il);
-
-                //GeLU
-                cur_gate = ggml_gelu(ctx0, cur_gate);
-                cb(cur_gate, "ffn_moe_gelu", il);
-
-                cur_expert = ggml_mul(ctx0, cur_up, cur_gate); // [n_tokens, n_embd]
-                cb(cur_expert, "ffn_moe_gate_par", il);
-
-                cur_expert = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exp, n_expert, selected_experts, i, cur_expert); // [n_tokens, n_embd]
-                cb(cur_expert, "ffn_moe_down", il);
-
-                cur_expert = ggml_mul(ctx0, cur_expert,
-                        ggml_view_2d(ctx0, weights, 1, n_tokens, weights->nb[1], i*weights->nb[0]));
-                cb(cur_expert, "ffn_moe_weighted", il);
-
-                if (i == 0) {
-                    moe_out = cur_expert;
-                } else {
-                    moe_out = ggml_add(ctx0, moe_out, cur_expert);
-                    cb(moe_out, "ffn_moe_out", il);
-                }
-            }
-
-            cur = moe_out;
+            cur = llm_build_moe_ffn(ctx0, cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    n_expert, n_expert_used,
+                    LLM_FFN_GELU, true,
+                    false, 0.0,
+                    cb, il);
+            cb(cur, "ffn_moe_out", il);
 
             // Grok
             // if layer_out_norm is present then apply it before adding the input
@@ -6652,7 +8021,6 @@ struct llm_build_context {
                         LLM_NORM_RMS, cb, il);
                 cb(cur, "layer_out_norm", il);
             }
-
 
             cur = ggml_add(ctx0, cur, ffn_inp);
             cb(cur, "ffn_out", il);
@@ -6681,6 +8049,135 @@ struct llm_build_context {
         // multiply logits by output_multiplier_scale of 0.5773502691896257
 
         cur = ggml_scale(ctx0, cur, 0.5773502691896257f);
+
+        cb(cur, "result_output", -1);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return gf;
+    }
+
+    struct ggml_cgraph * build_dbrx() {
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+        const int64_t n_embd_gqa  = hparams.n_embd_v_gqa();
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+        GGML_ASSERT(n_embd_head == hparams.n_rot);
+
+        struct ggml_tensor * cur;
+        struct ggml_tensor * inpL;
+
+        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+        // inp_pos - contains the positions
+        struct ggml_tensor * inp_pos = build_inp_pos();
+
+        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
+        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+
+        for (int il = 0; il < n_layer; ++il) {
+            struct ggml_tensor * inpSA = inpL;
+
+            // norm
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                                 model.layers[il].attn_norm, NULL,
+                                 LLM_NORM, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self-attention
+            {
+                struct ggml_tensor * Qcur = nullptr;
+                struct ggml_tensor * Kcur = nullptr;
+                struct ggml_tensor * Vcur = nullptr;
+
+                cur = ggml_mul_mat(ctx0, model.layers[il].wqkv, cur);
+                cb(cur, "wqkv", il);
+
+                cur = ggml_clamp(ctx0, cur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+                cb(cur, "wqkv_clamped", il);
+
+                Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd,     n_tokens, cur->nb[1], 0*sizeof(float)*(n_embd)));
+                Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd_gqa, n_tokens, cur->nb[1], 1*sizeof(float)*(n_embd)));
+                Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd_gqa, n_tokens, cur->nb[1], 1*sizeof(float)*(n_embd + n_embd_gqa)));
+
+                cb(Qcur, "Qcur", il);
+                cb(Kcur, "Kcur", il);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Qcur, "Qcur", il);
+
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Kcur, "Kcur", il);
+
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                        model.layers[il].wo, NULL,
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            cb(ffn_inp, "ffn_inp", il);
+
+            // feed-forward network
+            // MoE branch
+            cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                                 model.layers[il].attn_out_norm, NULL,
+                                 LLM_NORM, cb, il);
+            cb(cur, "attn_out_norm", il);
+
+            cur = llm_build_moe_ffn(ctx0, cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, true,
+                    false, 0.0,
+                    cb, il);
+            cb(cur, "ffn_moe_out", il);
+
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            cb(cur, "ffn_out", il);
+
+            ggml_tensor * layer_dir = lctx.cvec.tensor_for(il);
+            if (layer_dir != nullptr) {
+                cur = ggml_add(ctx0, cur, layer_dir);
+            }
+            cb(cur, "l_out", il);
+
+            // input for next layer
+            inpL = cur;
+        }
+
+        cur = inpL;
+
+        cur = llm_build_norm(ctx0, cur, hparams,
+                             model.output_norm, NULL,
+                             LLM_NORM, cb, -1);
+        cb(cur, "result_norm", -1);
+
+        // lm_head
+        cur = ggml_mul_mat(ctx0, model.output, cur);
 
         cb(cur, "result_output", -1);
 
@@ -6738,9 +8235,16 @@ struct llm_build_context {
 
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
             }
 
             // add the input
@@ -6782,206 +8286,6 @@ struct llm_build_context {
         return gf;
     }
 
-    struct ggml_cgraph * build_persimmon() {
-        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
-
-        const int64_t n_embd_head = hparams.n_embd_head_v;
-        GGML_ASSERT(n_embd_head   == hparams.n_embd_head_k);
-        GGML_ASSERT(n_embd_head/2 == hparams.n_rot);
-
-        struct ggml_tensor * cur;
-        struct ggml_tensor * inpL;
-
-        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
-
-        // inp_pos - contains the positions
-        struct ggml_tensor * inp_pos = build_inp_pos();
-
-        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
-        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
-
-        for (int il = 0; il < n_layer; ++il) {
-            struct ggml_tensor * residual = inpL;
-
-            cur = llm_build_norm(ctx0, inpL, hparams,
-                    model.layers[il].attn_norm,
-                    model.layers[il].attn_norm_b,
-                    LLM_NORM, cb, il);
-            cb(cur, "attn_norm", il);
-
-            // self attention
-            {
-                cur = ggml_mul_mat(ctx0, model.layers[il].wqkv, cur);
-                cb(cur, "wqkv", il);
-
-                cur = ggml_add(ctx0, cur, model.layers[il].bqkv);
-                cb(cur, "bqkv", il);
-
-                // split qkv
-                GGML_ASSERT(n_head_kv == n_head);
-
-                struct ggml_tensor * tmpqkv = ggml_reshape_4d(ctx0, cur, n_embd_head, 3, n_head, n_tokens);
-                cb(tmpqkv, "tmpqkv", il);
-
-                struct ggml_tensor * tmpqkv_perm = ggml_cont(ctx0, ggml_permute(ctx0, tmpqkv, 0, 3, 1, 2));
-                cb(tmpqkv_perm, "tmpqkv", il);
-
-                struct ggml_tensor * tmpq = ggml_view_3d(
-                        ctx0, tmpqkv_perm, n_embd_head, n_head, n_tokens,
-                        ggml_element_size(tmpqkv_perm) * n_embd_head,
-                        ggml_element_size(tmpqkv_perm) * n_embd_head * n_head,
-                        0
-                        );
-                cb(tmpq, "tmpq", il);
-
-                struct ggml_tensor * tmpk = ggml_view_3d(
-                        ctx0, tmpqkv_perm, n_embd_head, n_head, n_tokens,
-                        ggml_element_size(tmpqkv_perm) * n_embd_head,
-                        ggml_element_size(tmpqkv_perm) * n_embd_head * n_head,
-                        ggml_element_size(tmpqkv_perm) * n_embd_head * n_head * n_tokens
-                        );
-                cb(tmpk, "tmpk", il);
-
-                // Q/K Layernorm
-                tmpq = llm_build_norm(ctx0, tmpq, hparams,
-                        model.layers[il].attn_q_norm,
-                        model.layers[il].attn_q_norm_b,
-                        LLM_NORM, cb, il);
-                cb(tmpq, "tmpq", il);
-
-                tmpk = llm_build_norm(ctx0, tmpk, hparams,
-                        model.layers[il].attn_k_norm,
-                        model.layers[il].attn_k_norm_b,
-                        LLM_NORM, cb, il);
-                cb(tmpk, "tmpk", il);
-
-                // RoPE the first n_rot of q/k, pass the other half, and concat.
-                struct ggml_tensor * qrot = ggml_view_3d(
-                        ctx0, tmpq, n_rot, n_head, n_tokens,
-                        ggml_element_size(tmpq) * n_embd_head,
-                        ggml_element_size(tmpq) * n_embd_head * n_head,
-                        0
-                        );
-                cb(qrot, "qrot", il);
-
-                struct ggml_tensor * krot = ggml_view_3d(
-                        ctx0, tmpk, n_rot, n_head, n_tokens,
-                        ggml_element_size(tmpk) * n_embd_head,
-                        ggml_element_size(tmpk) * n_embd_head * n_head,
-                        0
-                        );
-                cb(krot, "krot", il);
-
-                // get the second half of tmpq, e.g tmpq[n_rot:, :, :]
-                struct ggml_tensor * qpass = ggml_view_3d(
-                        ctx0, tmpq, n_rot, n_head, n_tokens,
-                        ggml_element_size(tmpq) * n_embd_head,
-                        ggml_element_size(tmpq) * n_embd_head * n_head,
-                        ggml_element_size(tmpq) * n_rot
-                        );
-                cb(qpass, "qpass", il);
-
-                struct ggml_tensor * kpass = ggml_view_3d(
-                        ctx0, tmpk, n_rot, n_head, n_tokens,
-                        ggml_element_size(tmpk) * n_embd_head,
-                        ggml_element_size(tmpk) * n_embd_head * n_head,
-                        ggml_element_size(tmpk) * n_rot
-                        );
-                cb(kpass, "kpass", il);
-
-                struct ggml_tensor * qrotated = ggml_rope_custom(
-                    ctx0, qrot, inp_pos, n_rot, rope_type, 0, n_orig_ctx,
-                    freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
-                );
-                cb(qrotated, "qrotated", il);
-
-                struct ggml_tensor * krotated = ggml_rope_custom(
-                    ctx0, krot, inp_pos, n_rot, rope_type, 0, n_orig_ctx,
-                    freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
-                );
-                cb(krotated, "krotated", il);
-
-                // ggml currently only supports concatenation on dim=2
-                // so we need to permute qrot, qpass, concat, then permute back.
-                qrotated = ggml_cont(ctx0, ggml_permute(ctx0, qrotated, 2, 1, 0, 3));
-                cb(qrotated, "qrotated", il);
-
-                krotated = ggml_cont(ctx0, ggml_permute(ctx0, krotated, 2, 1, 0, 3));
-                cb(krotated, "krotated", il);
-
-                qpass = ggml_cont(ctx0, ggml_permute(ctx0, qpass, 2, 1, 0, 3));
-                cb(qpass, "qpass", il);
-
-                kpass = ggml_cont(ctx0, ggml_permute(ctx0, kpass, 2, 1, 0, 3));
-                cb(kpass, "kpass", il);
-
-                struct ggml_tensor * Qcur = ggml_concat(ctx0, qrotated, qpass);
-                cb(Qcur, "Qcur", il);
-
-                struct ggml_tensor * Kcur = ggml_concat(ctx0, krotated, kpass);
-                cb(Kcur, "Kcur", il);
-
-                struct ggml_tensor * Q = ggml_cont(ctx0, ggml_permute(ctx0, Qcur, 2, 1, 0, 3));
-                cb(Q, "Q", il);
-
-                Kcur = ggml_cont(ctx0, ggml_permute(ctx0, Kcur, 2, 1, 0, 3));
-                cb(Kcur, "Kcur", il);
-
-                struct ggml_tensor * Vcur = ggml_view_3d(
-                        ctx0, tmpqkv_perm, n_embd_head, n_head, n_tokens,
-                        ggml_element_size(tmpqkv_perm) * n_embd_head,
-                        ggml_element_size(tmpqkv_perm) * n_embd_head * n_head,
-                        ggml_element_size(tmpqkv_perm) * n_embd_head * n_head * n_tokens * 2
-                        );
-                cb(Vcur, "Vcur", il);
-
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
-                        model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Q, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
-            }
-
-            struct ggml_tensor * ffn_inp = ggml_add(ctx0, residual, cur);
-            cb(ffn_inp, "ffn_inp", il);
-
-            // feed-forward network
-            {
-                cur = llm_build_norm(ctx0, ffn_inp, hparams,
-                        model.layers[il].ffn_norm,
-                        model.layers[il].ffn_norm_b,
-                        LLM_NORM, cb, il);
-                cb(cur, "ffn_norm", il);
-
-                cur = llm_build_ffn(ctx0, cur,
-                        model.layers[il].ffn_up,   model.layers[il].ffn_up_b,
-                        NULL,                      NULL,
-                        model.layers[il].ffn_down, model.layers[il].ffn_down_b,
-                        NULL,
-                        LLM_FFN_RELU_SQR, LLM_FFN_SEQ, cb, il);
-                cb(cur, "ffn_out", il);
-            }
-
-            cur = ggml_add(ctx0, cur, ffn_inp);
-            cb(cur, "l_out", il);
-
-            inpL = cur;
-        }
-
-        cur = inpL;
-
-        cur = llm_build_norm(ctx0, cur, hparams,
-                model.output_norm,
-                model.output_norm_b,
-                LLM_NORM, cb, -1);
-        cb(cur, "result_norm", -1);
-
-        cur = ggml_mul_mat(ctx0, model.output, cur);
-        cb(cur, "result_output", -1);
-
-        ggml_build_forward_expand(gf, cur);
-
-        return gf;
-    }
-
     struct ggml_cgraph * build_refact() {
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
 
@@ -6995,9 +8299,6 @@ struct llm_build_context {
 
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
-
-        // positions of the tokens in the KV cache
-        struct ggml_tensor * KQ_pos = build_inp_KQ_pos();
 
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;
@@ -7024,9 +8325,16 @@ struct llm_build_context {
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
                 cb(Qcur, "Qcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, KQ_pos, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -7081,8 +8389,11 @@ struct llm_build_context {
 
         struct ggml_tensor * cur;
         struct ggml_tensor * inpL;
+        struct ggml_tensor * inp_pos = nullptr;
 
-        struct ggml_tensor * inp_pos  = build_inp_pos();
+        if (model.arch != LLM_ARCH_JINA_BERT_V2) {
+            inp_pos = build_inp_pos();
+        }
         struct ggml_tensor * inp_mean = build_inp_mean();
         struct ggml_tensor * inp_cls  = build_inp_cls();
 
@@ -7113,13 +8424,26 @@ struct llm_build_context {
             struct ggml_tensor * Vcur;
 
             // self-attention
-            if (model.arch == LLM_ARCH_BERT) {
+            if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_JINA_BERT_V2) {
                 Qcur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.layers[il].wq, cur), model.layers[il].bq);
                 cb(Qcur, "Qcur", il);
+
+                if (model.layers[il].attn_q_norm) {
+                    Qcur = llm_build_norm(ctx0, Qcur, hparams,
+                            model.layers[il].attn_q_norm,
+                            model.layers[il].attn_q_norm_b,
+                            LLM_NORM, cb, il);
+                }
 
                 Kcur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.layers[il].wk, cur), model.layers[il].bk);
                 cb(Kcur, "Kcur", il);
 
+                if (model.layers[il].attn_k_norm) {
+                    Kcur = llm_build_norm(ctx0, Kcur, hparams,
+                            model.layers[il].attn_k_norm,
+                            model.layers[il].attn_k_norm_b,
+                            LLM_NORM, cb, il);
+                }
                 Vcur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.layers[il].wv, cur), model.layers[il].bv);
                 cb(Vcur, "Vcur", il);
 
@@ -7138,16 +8462,16 @@ struct llm_build_context {
                 cb(Kcur, "Kcur", il);
                 cb(Vcur, "Vcur", il);
 
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
@@ -7159,7 +8483,7 @@ struct llm_build_context {
             struct ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
             cb(kq, "kq", il);
 
-            kq = ggml_soft_max_ext(ctx0, kq, KQ_mask, nullptr, 1.0f/sqrtf(float(n_embd_head)), hparams.f_max_alibi_bias);
+            kq = ggml_soft_max_ext(ctx0, kq, KQ_mask, 1.0f/sqrtf(float(n_embd_head)), hparams.f_max_alibi_bias);
             cb(kq, "kq_soft_max_ext", il);
 
             struct ggml_tensor * v = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_embd_gqa, n_tokens)));
@@ -7186,11 +8510,23 @@ struct llm_build_context {
             }
             cb(cur, "kqv_out", il);
 
+            if (il == n_layer - 1 && pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+            }
+
             // re-add the layer input
             cur = ggml_add(ctx0, cur, inpL);
 
             // attention layer norm
             cur = llm_build_norm(ctx0, cur, hparams, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, cb, il);
+
+            if (model.layers[il].attn_norm_2 != nullptr) {
+                cur = ggml_add(ctx0, cur, inpL); // re-add the layer input
+                cur = llm_build_norm(ctx0, cur, hparams, model.layers[il].attn_norm_2, model.layers[il].attn_norm_2_b, LLM_NORM, cb, il);
+            }
 
             struct ggml_tensor * ffn_inp = cur;
             cb(ffn_inp, "ffn_inp", il);
@@ -7203,6 +8539,13 @@ struct llm_build_context {
                         model.layers[il].ffn_down, model.layers[il].ffn_down_b,
                         NULL,
                         LLM_FFN_GELU, LLM_FFN_SEQ, cb, il);
+            } else if (model.arch == LLM_ARCH_JINA_BERT_V2) {
+                cur = llm_build_ffn(ctx0, cur,
+                        model.layers[il].ffn_up,   NULL,
+                        model.layers[il].ffn_gate, NULL,
+                        model.layers[il].ffn_down, model.layers[il].ffn_down_b,
+                        NULL,
+                        LLM_FFN_GELU, LLM_FFN_PAR, cb, il);
             } else {
                 cur = llm_build_ffn(ctx0, cur,
                         model.layers[il].ffn_up,   NULL,
@@ -7269,9 +8612,6 @@ struct llm_build_context {
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-        // positions of the tokens in the KV cache
-        struct ggml_tensor * KQ_pos = build_inp_KQ_pos();
-
         inpL = llm_build_norm(ctx0, inpL, hparams,
                 model.tok_norm,
                 model.tok_norm_b,
@@ -7303,9 +8643,16 @@ struct llm_build_context {
 
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, KQ_pos, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
             }
 
             // Add the input
@@ -7355,6 +8702,7 @@ struct llm_build_context {
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
 
         struct ggml_tensor * cur;
+        struct ggml_tensor * pos;
         struct ggml_tensor * inpL;
 
         inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
@@ -7362,8 +8710,15 @@ struct llm_build_context {
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-        // positions of the tokens in the KV cache
-        struct ggml_tensor * KQ_pos = build_inp_KQ_pos();
+        if (model.pos_embd) {
+            // inp_pos - contains the positions
+            struct ggml_tensor * inp_pos = build_inp_pos();
+            pos = ggml_get_rows(ctx0, model.pos_embd, inp_pos);
+            cb(pos, "pos_embd", -1);
+
+            inpL = ggml_add(ctx0, inpL, pos);
+            cb(inpL, "inpL", -1);
+        }
 
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * attn_norm;
@@ -7399,11 +8754,40 @@ struct llm_build_context {
                 cb(Kcur, "Kcur", il);
                 cb(Vcur, "Vcur", il);
 
-                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+                // Q/K Layernorm
+                if (model.layers[il].attn_q_norm) {
+                    Qcur = llm_build_norm(ctx0, Qcur, hparams,
+                            model.layers[il].attn_q_norm,
+                            model.layers[il].attn_q_norm_b,
+                            LLM_NORM, cb, il);
+                    cb(Qcur, "Qcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
-                        model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, KQ_pos, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                    Kcur = llm_build_norm(ctx0, Kcur, hparams,
+                            model.layers[il].attn_k_norm,
+                            model.layers[il].attn_k_norm_b,
+                            LLM_NORM, cb, il);
+                    cb(Kcur, "Kcur", il);
+
+                    Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+                    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+
+                    cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                            model.layers[il].wo, model.layers[il].bo,
+                            Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                } else {
+                    Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+
+                    cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                            model.layers[il].wo, model.layers[il].bo,
+                            Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                }
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
             }
 
             // Add the input
@@ -7467,7 +8851,7 @@ struct llm_build_context {
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
         for (int il = 0; il < n_layer; ++il) {
-            struct ggml_tensor * inpSA = inpL;
+
 
             // norm
             cur = llm_build_norm(ctx0, inpL, hparams,
@@ -7475,6 +8859,8 @@ struct llm_build_context {
                     model.layers[il].attn_norm_b,
                     LLM_NORM, cb, il);
             cb(cur, "attn_norm", il);
+
+            struct ggml_tensor * inpSA = cur;
 
             // self-attention
             {
@@ -7500,36 +8886,69 @@ struct llm_build_context {
                     cb(Vcur, "Vcur", il);
                 }
 
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+                cb(Qcur, "Qcur", il);
+                Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+                cb(Kcur, "Kcur", il);
+
+                if (model.layers[il].attn_q_norm) {
+                    Qcur = llm_build_norm(ctx0, Qcur, hparams,
+                            model.layers[il].attn_q_norm,
+                            NULL,
+                            LLM_NORM, cb, il);
+                    cb(Qcur, "Qcur", il);
+                }
+                if (model.layers[il].attn_k_norm) {
+                    Kcur = llm_build_norm(ctx0, Kcur, hparams,
+                            model.layers[il].attn_k_norm,
+                            NULL,
+                            LLM_NORM, cb, il);
+                    cb(Kcur, "Kcur", il);
+                }
+
+
+                Qcur = ggml_rope_ext(
+                    ctx0, Qcur, inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, Kcur, inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
             }
 
-            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpL  = ggml_get_rows(ctx0,  inpL, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
             cb(ffn_inp, "ffn_inp", il);
 
             // feed-forward network
             {
-                cur = llm_build_norm(ctx0, ffn_inp, hparams,
-                        model.layers[il].ffn_norm,
-                        model.layers[il].ffn_norm_b,
-                        LLM_NORM, cb, il);
-                cb(cur, "ffn_norm", il);
-
+                if (model.layers[il].ffn_norm) {
+                    cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                            model.layers[il].ffn_norm,
+                            model.layers[il].ffn_norm_b,
+                            LLM_NORM, cb, il);
+                    cb(cur, "ffn_norm", il);
+                } else {
+                    // parallel residual
+                    cur = inpSA;
+                }
                 cur = llm_build_ffn(ctx0, cur,
                         model.layers[il].ffn_up,   NULL,
                         model.layers[il].ffn_gate, NULL,
@@ -7608,21 +9027,28 @@ struct llm_build_context {
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
 
                 // using mode = 2 for neox mode
-                Qcur = ggml_rope_custom(
-                    ctx0, Qcur, inp_pos, n_rot, rope_type, 0, n_orig_ctx,
+                Qcur = ggml_rope_ext(
+                    ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, Kcur, inp_pos, n_rot, rope_type, 0, n_orig_ctx,
+                Kcur = ggml_rope_ext(
+                    ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -7712,29 +9138,30 @@ struct llm_build_context {
                 Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
                 cb(Vcur, "Vcur", il);
 
-                // these nodes are added to the graph together so that they are not reordered
-                // by doing so, the number of splits in the graph is reduced
-                ggml_build_forward_expand(gf, Qcur);
-                ggml_build_forward_expand(gf, Kcur);
-                ggml_build_forward_expand(gf, Vcur);
-
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -7753,6 +9180,151 @@ struct llm_build_context {
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
             cb(cur, "ffn_out", il);
+
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            cb(cur, "l_out", il);
+
+            // input for next layer
+            inpL = cur;
+        }
+
+        cur = inpL;
+
+        cur = llm_build_norm(ctx0, cur, hparams,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, cb, -1);
+        cb(cur, "result_norm", -1);
+
+        // lm_head
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return gf;
+    }
+
+    struct ggml_cgraph * build_qwen2moe() {
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+        GGML_ASSERT(n_embd_head == hparams.n_rot);
+
+        struct ggml_tensor * cur;
+        struct ggml_tensor * inpL;
+
+        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+        // inp_pos - contains the positions
+        struct ggml_tensor * inp_pos = build_inp_pos();
+
+        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
+        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+
+        for (int il = 0; il < n_layer; ++il) {
+            struct ggml_tensor * inpSA = inpL;
+
+            // norm
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                    model.layers[il].attn_norm, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self_attention
+            {
+                // compute Q and K and RoPE them
+                struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+                cb(Qcur, "Qcur", il);
+                Qcur = ggml_add(ctx0, Qcur, model.layers[il].bq);
+                cb(Qcur, "Qcur", il);
+
+                struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.layers[il].wk, cur);
+                cb(Kcur, "Kcur", il);
+                Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk);
+                cb(Kcur, "Kcur", il);
+
+                struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
+                cb(Vcur, "Vcur", il);
+                Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Qcur, "Qcur", il);
+
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Kcur, "Kcur", il);
+
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                        model.layers[il].wo, model.layers[il].bo,
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            cb(ffn_inp, "ffn_inp", il);
+
+            // MoE branch
+            cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                    model.layers[il].ffn_norm, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "ffn_norm", il);
+
+            ggml_tensor * moe_out =
+                    llm_build_moe_ffn(ctx0, cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, false,
+                        false, 0.0,
+                        cb, il);
+            cb(cur, "ffn_moe_out", il);
+
+            // FFN shared expert
+            {
+                ggml_tensor * cur_gate_inp = ggml_mul_mat(ctx0, model.layers[il].ffn_gate_inp_shexp, cur);
+                cb(cur_gate_inp, "ffn_shexp_gate_inp", il);
+
+                // sigmoid
+                ggml_tensor * cur_gate = ggml_div(ctx0, ggml_silu(ctx0, cur_gate_inp), cur_gate_inp);
+                cb(cur_gate, "ffn_shexp_gate", il);
+
+                ggml_tensor * cur_ffn = llm_build_ffn(ctx0, cur,
+                        model.layers[il].ffn_up_shexp,   NULL,
+                        model.layers[il].ffn_gate_shexp, NULL,
+                        model.layers[il].ffn_down_shexp, NULL,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                cb(cur_ffn, "ffn_shexp", il);
+
+                ggml_tensor * ffn_shexp_out = ggml_mul(ctx0, cur_ffn, cur_gate);
+                cb(ffn_shexp_out, "ffn_shexp_out", il);
+
+                moe_out = ggml_add(ctx0, moe_out, ffn_shexp_out);
+                cb(moe_out, "ffn_out", il);
+
+                cur = moe_out;
+            }
 
             cur = ggml_add(ctx0, cur, ffn_inp);
             cb(cur, "l_out", il);
@@ -7833,8 +9405,8 @@ struct llm_build_context {
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
 
-                Qcur = ggml_rope_custom(
-                    ctx0, Qcur, inp_pos, n_rot, rope_type, 0, n_orig_ctx,
+                Qcur = ggml_rope_ext(
+                    ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
@@ -7844,15 +9416,23 @@ struct llm_build_context {
                 Qcur = ggml_scale(ctx0, Qcur, 1.0f/sqrtf(float(n_embd_head)));
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, Kcur, inp_pos, n_rot, rope_type, 0, n_orig_ctx,
+                Kcur = ggml_rope_ext(
+                    ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f, cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f, cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur              = ggml_get_rows(ctx0,              cur, inp_out_ids);
+                inpL             = ggml_get_rows(ctx0,             inpL, inp_out_ids);
+                attn_norm_output = ggml_get_rows(ctx0, attn_norm_output, inp_out_ids);
             }
 
             // FF
@@ -7886,11 +9466,142 @@ struct llm_build_context {
 
         cur = ggml_add(ctx0, cur, model.output_b);
         cb(cur, "result_output", -1);
+        ggml_build_forward_expand(gf, cur);
+        return gf;
+    }
+
+    struct ggml_cgraph * build_phi3() {
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+        const int64_t n_embd_gqa = hparams.n_embd_v_gqa();
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+
+        struct ggml_tensor * cur;
+        struct ggml_tensor * inpL;
+
+        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+        // inp_pos - contains the positions
+        struct ggml_tensor * inp_pos = build_inp_pos();
+
+        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
+        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+
+        for (int il = 0; il < n_layer; ++il) {
+            auto residual = inpL;
+
+            // self-attention
+            {
+                // rope freq factors for 128k context
+                struct ggml_tensor * rope_factors = build_rope_factors(il);
+
+                struct ggml_tensor* attn_norm_output = llm_build_norm(ctx0, inpL, hparams,
+                    model.layers[il].attn_norm,
+                    NULL,
+                    LLM_NORM_RMS, cb, il);
+                cb(attn_norm_output, "attn_norm", il);
+
+                struct ggml_tensor * Qcur = nullptr;
+                struct ggml_tensor * Kcur = nullptr;
+                struct ggml_tensor * Vcur = nullptr;
+
+                if (model.layers[il].wqkv) {
+                    cur = ggml_mul_mat(ctx0, model.layers[il].wqkv, attn_norm_output);
+                    cb(cur, "wqkv", il);
+
+                    Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd,     n_tokens, cur->nb[1], 0 * sizeof(float) * (n_embd)));
+                    Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd_gqa, n_tokens, cur->nb[1], 1 * sizeof(float) * (n_embd)));
+                    Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd_gqa, n_tokens, cur->nb[1], 1 * sizeof(float) * (n_embd + n_embd_gqa)));
+                }
+                else {
+                    Qcur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.layers[il].wq, attn_norm_output), model.layers[il].bq);
+                    Kcur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.layers[il].wk, attn_norm_output), model.layers[il].bk);
+                    Vcur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.layers[il].wv, attn_norm_output), model.layers[il].bv);
+                }
+
+                cb(Qcur, "Qcur", il);
+                cb(Kcur, "Kcur", il);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+                Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+
+                Qcur = ggml_rope_ext(
+                    ctx0, Qcur, inp_pos, rope_factors, n_rot, rope_type, n_ctx_orig,
+                    freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Qcur, "Qcur", il);
+
+                Qcur = ggml_scale(ctx0, Qcur, 1.0f / sqrtf(float(n_embd_head)));
+                cb(Qcur, "Qcur", il);
+
+                Kcur = ggml_rope_ext(
+                    ctx0, Kcur, inp_pos, rope_factors, n_rot, rope_type, n_ctx_orig,
+                    freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Kcur, "Kcur", il);
+
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                        model.layers[il].wo, model.layers[il].bo,
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f, cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor* inp_out_ids = build_inp_out_ids();
+                cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+                residual = ggml_get_rows(ctx0, residual, inp_out_ids);
+            }
+
+            cur = ggml_add(ctx0, cur, residual);
+            residual = cur;
+
+            cur = llm_build_norm(ctx0, cur, hparams,
+                model.layers[il].ffn_norm, NULL,
+                LLM_NORM_RMS, cb, il);
+            cb(cur, "ffn_norm", il);
+
+            // FF
+            // special-case: the up and gate tensors are merged into a single tensor
+            // TOOD: support into llm_build_ffn
+            {
+                struct ggml_tensor* up = ggml_mul_mat(ctx0, model.layers[il].ffn_up, cur);
+                cb(up, "ffn_up", il);
+
+                auto g = ggml_cont(ctx0, ggml_view_2d(ctx0, up, up->ne[0] / 2, up->ne[1], ggml_row_size(up->type, up->ne[0]), 0));
+                auto y = ggml_cont(ctx0, ggml_view_2d(ctx0, up, up->ne[0] / 2, up->ne[1], ggml_row_size(up->type, up->ne[0]), up->nb[1] / 2));
+
+                y = ggml_mul(ctx0, y, ggml_silu(ctx0, g));
+                cb(y, "ffn_gate", il);
+
+                auto down = ggml_mul_mat(ctx0, model.layers[il].ffn_down, y);
+                cb(down, "ffn_down", il);
+
+                cur = down;
+                cb(cur, "ffn_out", il);
+            }
+
+            cur = ggml_add(ctx0, residual, cur);
+            cb(cur, "l_out", il);
+
+            inpL = cur;
+        }
+
+        cur = llm_build_norm(ctx0, inpL, hparams,
+            model.output_norm,
+            NULL,
+            LLM_NORM_RMS, cb, -1);
+        cb(cur, "result_norm", -1);
+
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
 
         ggml_build_forward_expand(gf, cur);
 
         return gf;
     }
+
 
     struct ggml_cgraph * build_plamo() {
         struct ggml_cgraph * gf = ggml_new_graph(ctx0);
@@ -7932,25 +9643,33 @@ struct llm_build_context {
                 struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
                 cb(Vcur, "Vcur", il);
 
-                Qcur = ggml_rope_custom(
-                        ctx0, ggml_reshape_3d(ctx0, Qcur, n_rot, n_head,    n_tokens), inp_pos,
-                        n_embd_head, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                        ctx0, ggml_reshape_3d(ctx0, Qcur, n_rot, n_head,    n_tokens), inp_pos, nullptr,
+                        n_embd_head, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                        ctx0, ggml_reshape_3d(ctx0, Kcur, n_rot, n_head_kv, n_tokens), inp_pos,
-                        n_embd_head, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                        ctx0, ggml_reshape_3d(ctx0, Kcur, n_rot, n_head_kv, n_tokens), inp_pos, nullptr,
+                        n_embd_head, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
             }
             struct ggml_tensor * sa_out = cur;
 
             cur = attention_norm;
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur    = ggml_get_rows(ctx0,    cur, inp_out_ids);
+                sa_out = ggml_get_rows(ctx0, sa_out, inp_out_ids);
+                inpL   = ggml_get_rows(ctx0,   inpL, inp_out_ids);
+            }
 
             // feed-forward network
             {
@@ -8039,9 +9758,16 @@ struct llm_build_context {
 
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
             }
 
             // add the input
@@ -8125,23 +9851,30 @@ struct llm_build_context {
                 cb(tmpk, "tmpk", il);
                 cb(Vcur, "Vcur", il);
 
-                struct ggml_tensor * Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, tmpq, n_embd_head, n_head,    n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                struct ggml_tensor * Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, tmpq, n_embd_head, n_head,    n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                struct ggml_tensor * Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, tmpk, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                struct ggml_tensor * Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, tmpk, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
             }
 
             // add the input
@@ -8234,23 +9967,30 @@ struct llm_build_context {
                 //     cb(Vcur, "Vcur", il);
                 // }
 
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -8344,23 +10084,30 @@ struct llm_build_context {
                     cb(Vcur, "Vcur", il);
                 }
 
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -8467,23 +10214,30 @@ struct llm_build_context {
                     cb(Vcur, "Vcur", il);
                 }
 
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             // scale_res - scale the hidden states for residual connection
@@ -8534,7 +10288,7 @@ struct llm_build_context {
         cb(cur, "lmhead_scaling", -1);
 
         // lm_head
-        cur = ggml_mul_mat(ctx0, model.tok_embd, cur);
+        cur = ggml_mul_mat(ctx0, model.output, cur);
         cb(cur, "result_output", -1);
 
         ggml_build_forward_expand(gf, cur);
@@ -8580,24 +10334,31 @@ struct llm_build_context {
                 struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
                 cb(Vcur, "Vcur", il);
 
-                Qcur = ggml_rope_custom(
-                        ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head_k, n_head,    n_tokens), inp_pos,
-                        n_embd_head_k, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                        ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head_k, n_head,    n_tokens), inp_pos, nullptr,
+                        n_embd_head_k, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Qcur, "Qcur", il);
 
                 Qcur = ggml_scale(ctx0, Qcur, 1.0f / sqrtf(float(n_embd_head_k)));
                 cb(Qcur, "Qcur_scaled", il);
 
-                Kcur = ggml_rope_custom(
-                        ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head_k, n_head_kv, n_tokens), inp_pos,
-                        n_embd_head_k, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                        ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head_k, n_head_kv, n_tokens), inp_pos, nullptr,
+                        n_embd_head_k, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f, cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f, cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
             }
 
             struct ggml_tensor * sa_out = ggml_add(ctx0, cur, inpL);
@@ -8693,23 +10454,30 @@ struct llm_build_context {
                     cb(Vcur, "Vcur", il);
                 }
 
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -8859,6 +10627,15 @@ struct llm_build_context {
 
                 struct ggml_tensor * y = ggml_view_2d(ctx0, y_ssm_states, d_inner, n_tokens, d_inner*ggml_element_size(y_ssm_states), 0);
 
+                if (il == n_layer - 1) {
+                    // skip computing output for unused tokens
+                    struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                    x    = ggml_get_rows(ctx0,    x, inp_out_ids);
+                    y    = ggml_get_rows(ctx0,    y, inp_out_ids);
+                    z    = ggml_get_rows(ctx0,    z, inp_out_ids);
+                    inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+                }
+
                 // {d_inner, n_tokens} * {d_inner} => {d_inner, n_tokens}
                 y = ggml_add(ctx0, y, ggml_mul(ctx0, x, model.layers[il].ssm_d));
                 y = ggml_mul(ctx0, y, ggml_silu(ctx0, z));
@@ -8942,23 +10719,56 @@ struct llm_build_context {
                     cb(Vcur, "Vcur", il);
                 }
 
-                Qcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                if (model.layers[il].attn_q_norm) {
+                    Qcur = ggml_view_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens,
+                                ggml_element_size(Qcur) * n_embd_head,
+                                ggml_element_size(Qcur) * n_embd_head * n_head,
+                                0);
+                    cb(Qcur, "Qcur", il);
+                    Kcur = ggml_view_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens,
+                                ggml_element_size(Kcur) * n_embd_head,
+                                ggml_element_size(Kcur) * n_embd_head * n_head_kv,
+                                0);
+                    cb(Kcur, "Kcur", il);
+
+                    Qcur = llm_build_norm(ctx0, Qcur, hparams,
+                                model.layers[il].attn_q_norm,
+                                NULL,
+                                LLM_NORM, cb, il);
+                    cb(Qcur, "Qcur", il);
+
+                    Kcur = llm_build_norm(ctx0, Kcur, hparams,
+                            model.layers[il].attn_k_norm,
+                            NULL,
+                            LLM_NORM, cb, il);
+                    cb(Kcur, "Kcur", il);
+                }
+
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
-                Kcur = ggml_rope_custom(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
-                    n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
-                cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
-                        Kcur, Vcur, Qcur, KQ_mask, nullptr, n_ctx, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur     = ggml_get_rows(ctx0,     cur, inp_out_ids);
+                inpL    = ggml_get_rows(ctx0,    inpL, inp_out_ids);
+                ffn_inp = ggml_get_rows(ctx0, ffn_inp, inp_out_ids);
             }
 
             struct ggml_tensor * attn_out = cur;
@@ -9004,6 +10814,641 @@ struct llm_build_context {
         return gf;
 
     }
+
+    // ref: https://allenai.org/olmo
+    // based on the original build_llama() function, changes:
+    //   * non-parametric layer norm
+    //   * clamp qkv
+    //   * removed bias
+    //   * removed MoE
+    struct ggml_cgraph * build_olmo() {
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+        GGML_ASSERT(n_embd_head == hparams.n_rot);
+
+        struct ggml_tensor * cur;
+        struct ggml_tensor * inpL;
+
+        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+        // inp_pos - contains the positions
+        struct ggml_tensor * inp_pos = build_inp_pos();
+
+        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
+        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+
+        for (int il = 0; il < n_layer; ++il) {
+            struct ggml_tensor * inpSA = inpL;
+
+            // norm
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                    NULL, NULL,
+                    LLM_NORM, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self-attention
+            {
+                // compute Q and K and RoPE them
+                struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+                cb(Qcur, "Qcur", il);
+                if (hparams.f_clamp_kqv > 0.0f) {
+                    Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+                    cb(Qcur, "Qcur", il);
+                }
+
+                struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.layers[il].wk, cur);
+                cb(Kcur, "Kcur", il);
+                if (hparams.f_clamp_kqv > 0.0f) {
+                    Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+                    cb(Kcur, "Kcur", il);
+                }
+
+                struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
+                cb(Vcur, "Vcur", il);
+                if (hparams.f_clamp_kqv > 0.0f) {
+                    Vcur = ggml_clamp(ctx0, Vcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+                    cb(Vcur, "Vcur", il);
+                }
+
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Qcur, "Qcur", il);
+
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Kcur, "Kcur", il);
+
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                        model.layers[il].wo, nullptr,
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            cb(ffn_inp, "ffn_inp", il);
+
+            // feed-forward network
+            cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                    NULL, NULL,
+                    LLM_NORM, cb, il);
+            cb(cur, "ffn_norm", il);
+
+            cur = llm_build_ffn(ctx0, cur,
+                    model.layers[il].ffn_up,   NULL,
+                    model.layers[il].ffn_gate, NULL,
+                    model.layers[il].ffn_down, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+            cb(cur, "ffn_out", il);
+
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            cb(cur, "ffn_out", il);
+
+            ggml_tensor * layer_dir = lctx.cvec.tensor_for(il);
+            if (layer_dir != nullptr) {
+                cur = ggml_add(ctx0, cur, layer_dir);
+            }
+            cb(cur, "l_out", il);
+
+            // input for next layer
+            inpL = cur;
+        }
+
+        cur = inpL;
+
+        cur = llm_build_norm(ctx0, cur, hparams,
+                NULL, NULL,
+                LLM_NORM, cb, -1);
+        cb(cur, "result_norm", -1);
+
+        // lm_head
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return gf;
+    }
+
+    struct ggml_cgraph * build_gptneox() {
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+        const int64_t n_embd_gqa  = hparams.n_embd_v_gqa();
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+
+        struct ggml_tensor * cur;
+        struct ggml_tensor * inpL;
+
+        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+        // inp_pos - contains the positions
+        struct ggml_tensor * inp_pos = build_inp_pos();
+
+        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
+        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+
+        for (int il = 0; il < n_layer; ++il) {
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                    model.layers[il].attn_norm,
+                    model.layers[il].attn_norm_b,
+                    LLM_NORM, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self-attention
+            {
+                cur = ggml_mul_mat(ctx0, model.layers[il].wqkv, cur);
+                cb(cur, "wqkv", il);
+
+                cur = ggml_add(ctx0, cur, model.layers[il].bqkv);
+                cb(cur, "bqkv", il);
+
+                struct ggml_tensor * Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd,     n_tokens, cur->nb[1], 0*sizeof(float)*(n_embd)));
+                struct ggml_tensor * Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd_gqa, n_tokens, cur->nb[1], 1*sizeof(float)*(n_embd)));
+                struct ggml_tensor * Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd_gqa, n_tokens, cur->nb[1], 1*sizeof(float)*(n_embd + n_embd_gqa)));
+
+                cb(Qcur, "Qcur", il);
+                cb(Kcur, "Kcur", il);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Qcur, "Qcur", il);
+
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Kcur, "Kcur", il);
+
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                        model.layers[il].wo, model.layers[il].bo,
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+            }
+
+            // ffn
+            if (hparams.use_par_res) {
+                // attention and ffn are computed in parallel
+                // x = x + attn(ln1(x)) + ffn(ln2(x))
+
+                struct ggml_tensor * attn_out = cur;
+
+                cur = llm_build_norm(ctx0, inpL, hparams,
+                        model.layers[il].ffn_norm,
+                        model.layers[il].ffn_norm_b,
+                        LLM_NORM, cb, il);
+                cb(cur, "ffn_norm", il);
+
+                cur = llm_build_ffn(ctx0, cur,
+                        model.layers[il].ffn_up,   model.layers[il].ffn_up_b,
+                        NULL,                      NULL,
+                        model.layers[il].ffn_down, model.layers[il].ffn_down_b,
+                        NULL,
+                        LLM_FFN_GELU, LLM_FFN_SEQ, cb, il);
+                cb(cur, "ffn_out", il);
+
+                cur = ggml_add(ctx0, cur, inpL);
+                cb(cur, "ffn_out", il);
+
+                inpL = ggml_add(ctx0, cur, attn_out);
+                cb(inpL, "l_out", il);
+            } else {
+                // attention and ffn are computed sequentially
+                // x = x + attn(ln1(x))
+                // x = x + ffn(ln2(x))
+
+                struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
+                cb(ffn_inp, "ffn_inp", il);
+
+                cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                        model.layers[il].ffn_norm,
+                        model.layers[il].ffn_norm_b,
+                        LLM_NORM, cb, il);
+                cb(cur, "ffn_norm", il);
+
+                cur = llm_build_ffn(ctx0, cur,
+                        model.layers[il].ffn_up,   model.layers[il].ffn_up_b,
+                        NULL,                      NULL,
+                        model.layers[il].ffn_down, model.layers[il].ffn_down_b,
+                        NULL,
+                        LLM_FFN_GELU, LLM_FFN_SEQ, cb, il);
+                cb(cur, "ffn_out", il);
+
+                inpL = ggml_add(ctx0, cur, ffn_inp);
+                cb(inpL, "l_out", il);
+            }
+        }
+
+        cur = llm_build_norm(ctx0, inpL, hparams,
+                model.output_norm,
+                model.output_norm_b,
+                LLM_NORM, cb, -1);
+        cb(cur, "result_norm", -1);
+
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return gf;
+    }
+
+    struct ggml_cgraph * build_arctic() {
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+        GGML_ASSERT(n_embd_head == hparams.n_rot);
+
+        struct ggml_tensor * cur;
+        struct ggml_tensor * inpL;
+
+        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+        // inp_pos - contains the positions
+        struct ggml_tensor * inp_pos = build_inp_pos();
+
+        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
+        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+
+        for (int il = 0; il < n_layer; ++il) {
+            struct ggml_tensor * inpSA = inpL;
+
+            // norm
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                    model.layers[il].attn_norm, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self-attention
+            {
+                // compute Q and K and RoPE them
+                struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+                cb(Qcur, "Qcur", il);
+
+                struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.layers[il].wk, cur);
+                cb(Kcur, "Kcur", il);
+
+                struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Qcur, "Qcur", il);
+
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Kcur, "Kcur", il);
+
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                        model.layers[il].wo, NULL,
+                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            cb(ffn_inp, "ffn_inp", il);
+
+            // feed-forward network
+            cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                    model.layers[il].ffn_norm, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "ffn_norm", il);
+
+            cur = llm_build_ffn(ctx0, cur,
+                    model.layers[il].ffn_up,   NULL,
+                    model.layers[il].ffn_gate, NULL,
+                    model.layers[il].ffn_down, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+            cb(cur, "ffn_out", il);
+
+            struct ggml_tensor * ffn_out = ggml_add(ctx0, cur, ffn_inp);
+            cb(ffn_out, "ffn_out", il);
+
+            // MoE
+            cur = llm_build_norm(ctx0, inpSA, hparams,
+                    model.layers[il].ffn_norm_exps, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "ffn_norm_exps", il);
+
+            cur = llm_build_moe_ffn(ctx0, cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, true,
+                    false, 0.0,
+                    cb, il);
+            cb(cur, "ffn_moe_out", il);
+
+            cur = ggml_add(ctx0, cur, ffn_out);
+            cb(cur, "ffn_out", il);
+
+            ggml_tensor * layer_dir = lctx.cvec.tensor_for(il);
+            if (layer_dir != nullptr) {
+                cur = ggml_add(ctx0, cur, layer_dir);
+            }
+            cb(cur, "l_out", il);
+
+            // input for next layer
+            inpL = cur;
+        }
+
+        cur = inpL;
+
+        cur = llm_build_norm(ctx0, cur, hparams,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, cb, -1);
+        cb(cur, "result_norm", -1);
+
+        // lm_head
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return gf;
+    }
+
+    struct ggml_cgraph * build_deepseek2() {
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
+
+        bool is_lite = (hparams.n_layer == 27);
+
+        // We have to pre-scale kq_scale and attn_factor to make the YaRN RoPE work correctly.
+        // See https://github.com/ggerganov/llama.cpp/discussions/7416 for detailed explanation.
+        const float mscale = attn_factor * (1.0f + hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
+        const float kq_scale = 1.0f*mscale*mscale/sqrtf(float(hparams.n_embd_head_k));
+        const float attn_factor_scaled = 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale));
+
+        const uint32_t n_embd_head_qk_rope = hparams.n_rot;
+        const uint32_t n_embd_head_qk_nope = hparams.n_embd_head_k - hparams.n_rot;
+        const uint32_t kv_lora_rank = hparams.n_lora_kv;
+
+        struct ggml_tensor * cur;
+        struct ggml_tensor * inpL;
+
+        // {n_embd, n_tokens}
+        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+        // inp_pos - contains the positions
+        struct ggml_tensor * inp_pos = build_inp_pos();
+
+        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
+        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+
+        for (int il = 0; il < n_layer; ++il) {
+            struct ggml_tensor * inpSA = inpL;
+
+            // norm
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                    model.layers[il].attn_norm, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self_attention
+            {
+                struct ggml_tensor * q = NULL;
+                if (!is_lite) {
+                    // {n_embd, q_lora_rank} * {n_embd, n_tokens} -> {q_lora_rank, n_tokens}
+                    q = ggml_mul_mat(ctx0, model.layers[il].wq_a, cur);
+                    cb(q, "q", il);
+
+                    q = llm_build_norm(ctx0, q, hparams,
+                            model.layers[il].attn_q_a_norm, NULL,
+                            LLM_NORM_RMS, cb, il);
+                    cb(q, "q", il);
+
+                    // {q_lora_rank, n_head * hparams.n_embd_head_k} * {q_lora_rank, n_tokens} -> {n_head * hparams.n_embd_head_k, n_tokens}
+                    q = ggml_mul_mat(ctx0, model.layers[il].wq_b, q);
+                    cb(q, "q", il);
+                } else {
+                    q = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+                    cb(q, "q", il);
+                }
+
+                // split into {n_head * n_embd_head_qk_nope, n_tokens}
+                struct ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens,
+                        ggml_row_size(q->type, hparams.n_embd_head_k),
+                        ggml_row_size(q->type, hparams.n_embd_head_k * n_head),
+                        0);
+                cb(q_nope, "q_nope", il);
+
+                // and {n_head * n_embd_head_qk_rope, n_tokens}
+                struct ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_qk_rope, n_head, n_tokens,
+                        ggml_row_size(q->type, hparams.n_embd_head_k),
+                        ggml_row_size(q->type, hparams.n_embd_head_k * n_head),
+                        ggml_row_size(q->type, n_embd_head_qk_nope));
+                cb(q_pe, "q_pe", il);
+
+                // {n_embd, kv_lora_rank + n_embd_head_qk_rope} * {n_embd, n_tokens} -> {kv_lora_rank + n_embd_head_qk_rope, n_tokens}
+                struct ggml_tensor * kv_pe_compresseed = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
+                cb(kv_pe_compresseed, "kv_pe_compresseed", il);
+
+                // split into {kv_lora_rank, n_tokens}
+                struct ggml_tensor * kv_compressed = ggml_view_2d(ctx0, kv_pe_compresseed, kv_lora_rank, n_tokens,
+                        kv_pe_compresseed->nb[1],
+                        0);
+                cb(kv_compressed, "kv_compressed", il);
+
+                // and {n_embd_head_qk_rope, n_tokens}
+                struct ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_pe_compresseed, n_embd_head_qk_rope, 1, n_tokens,
+                        kv_pe_compresseed->nb[1],
+                        kv_pe_compresseed->nb[1],
+                        ggml_row_size(kv_pe_compresseed->type, kv_lora_rank));
+                cb(k_pe, "k_pe", il);
+
+                kv_compressed = ggml_cont(ctx0, kv_compressed); // TODO: the CUDA backend does not support non-contiguous norm
+                kv_compressed = llm_build_norm(ctx0, kv_compressed, hparams,
+                        model.layers[il].attn_kv_a_norm, NULL,
+                        LLM_NORM_RMS, cb, il);
+                cb(kv_compressed, "kv_compressed", il);
+
+                // {kv_lora_rank, n_head * (n_embd_head_qk_nope + n_embd_head_v)} * {kv_lora_rank, n_tokens} -> {n_head * (n_embd_head_qk_nope + n_embd_head_v), n_tokens}
+                struct ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_compressed);
+                cb(kv, "kv", il);
+
+                // split into {n_head * n_embd_head_qk_nope, n_tokens}
+                struct ggml_tensor * k_nope = ggml_view_3d(ctx0, kv, n_embd_head_qk_nope, n_head, n_tokens,
+                        ggml_row_size(kv->type, n_embd_head_qk_nope + hparams.n_embd_head_v),
+                        ggml_row_size(kv->type, n_head * (n_embd_head_qk_nope + hparams.n_embd_head_v)),
+                        0);
+                cb(k_nope, "k_nope", il);
+
+                // and {n_head * n_embd_head_v, n_tokens}
+                struct ggml_tensor * v_states = ggml_view_3d(ctx0, kv, hparams.n_embd_head_v, n_head, n_tokens,
+                        ggml_row_size(kv->type, (n_embd_head_qk_nope + hparams.n_embd_head_v)),
+                        ggml_row_size(kv->type, (n_embd_head_qk_nope + hparams.n_embd_head_v)*n_head),
+                        ggml_row_size(kv->type, (n_embd_head_qk_nope)));
+                cb(v_states, "v_states", il);
+
+                v_states = ggml_cont(ctx0, v_states);
+                cb(v_states, "v_states", il);
+
+                v_states = ggml_view_2d(ctx0, v_states, hparams.n_embd_head_v * n_head, n_tokens,
+                    ggml_row_size(kv->type, hparams.n_embd_head_v * n_head),
+                    0);
+                cb(v_states, "v_states", il);
+
+                q_pe = ggml_cont(ctx0, q_pe); // TODO: the CUDA backend does not support non-contiguous RoPE
+                q_pe = ggml_rope_ext(
+                    ctx0, q_pe, inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor_scaled, beta_fast, beta_slow
+                );
+                cb(q_pe, "q_pe", il);
+
+                // shared RoPE key
+                k_pe = ggml_cont(ctx0, k_pe); // TODO: the CUDA backend does not support non-contiguous RoPE
+                k_pe = ggml_rope_ext(
+                    ctx0, k_pe, inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor_scaled, beta_fast, beta_slow
+                );
+                cb(k_pe, "k_pe", il);
+
+                struct ggml_tensor * q_states = ggml_concat(ctx0, q_nope, q_pe, 0);
+                cb(q_states, "q_states", il);
+
+                struct ggml_tensor * k_states = ggml_concat(ctx0, k_nope, ggml_repeat(ctx0, k_pe, q_pe), 0);
+                cb(k_states, "k_states", il);
+
+                cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
+                        model.layers[il].wo, NULL,
+                        k_states, v_states, q_states, KQ_mask, n_tokens, kv_head, n_kv, kq_scale, cb, il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            cb(ffn_inp, "ffn_inp", il);
+
+            if ((uint32_t) il < hparams.n_layer_dense_lead) {
+                cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                        model.layers[il].ffn_norm, NULL,
+                        LLM_NORM_RMS, cb, il);
+                cb(cur, "ffn_norm", il);
+
+                cur = llm_build_ffn(ctx0, cur,
+                        model.layers[il].ffn_up,   NULL,
+                        model.layers[il].ffn_gate, NULL,
+                        model.layers[il].ffn_down, NULL,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                cb(cur, "ffn_out", il);
+            } else {
+                // MoE branch
+                cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                        model.layers[il].ffn_norm, NULL,
+                        LLM_NORM_RMS, cb, il);
+                cb(cur, "ffn_norm", il);
+
+                ggml_tensor * moe_out =
+                        llm_build_moe_ffn(ctx0, cur,
+                            model.layers[il].ffn_gate_inp,
+                            model.layers[il].ffn_up_exps,
+                            model.layers[il].ffn_gate_exps,
+                            model.layers[il].ffn_down_exps,
+                            n_expert, n_expert_used,
+                            LLM_FFN_SILU, false,
+                            true, hparams.expert_weights_scale,
+                            cb, il);
+                cb(moe_out, "ffn_moe_out", il);
+
+                // FFN shared expert
+                {
+                    ggml_tensor * ffn_shexp = llm_build_ffn(ctx0, cur,
+                            model.layers[il].ffn_up_shexp,   NULL,
+                            model.layers[il].ffn_gate_shexp, NULL,
+                            model.layers[il].ffn_down_shexp, NULL,
+                            NULL,
+                            LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                    cb(ffn_shexp, "ffn_shexp", il);
+
+                    cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                    cb(cur, "ffn_out", il);
+                }
+            }
+
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            cb(cur, "l_out", il);
+
+            // input for next layer
+            inpL = cur;
+        }
+
+        cur = inpL;
+
+        cur = llm_build_norm(ctx0, cur, hparams,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, cb, -1);
+        cb(cur, "result_norm", -1);
+
+        // lm_head
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return gf;
+    }
+
 };
 
 static struct ggml_cgraph * llama_build_graph_defrag(llama_context & lctx, const std::vector<uint32_t> & ids) {
@@ -9120,15 +11565,12 @@ static struct ggml_cgraph * llama_build_graph(
             {
                 result = llm.build_starcoder();
             } break;
-        case LLM_ARCH_PERSIMMON:
-            {
-                result = llm.build_persimmon();
-            } break;
         case LLM_ARCH_REFACT:
             {
                 result = llm.build_refact();
             } break;
         case LLM_ARCH_BERT:
+        case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_NOMIC_BERT:
             {
                 result = llm.build_bert();
@@ -9153,9 +11595,17 @@ static struct ggml_cgraph * llama_build_graph(
             {
                 result = llm.build_qwen2();
             } break;
+        case LLM_ARCH_QWEN2MOE:
+            {
+                result = llm.build_qwen2moe();
+            } break;
         case LLM_ARCH_PHI2:
             {
                 result = llm.build_phi2();
+            } break;
+        case LLM_ARCH_PHI3:
+            {
+                result = llm.build_phi3();
             } break;
         case LLM_ARCH_PLAMO:
             {
@@ -9193,9 +11643,33 @@ static struct ggml_cgraph * llama_build_graph(
             {
                 result = llm.build_mamba();
             } break;
+        case LLM_ARCH_XVERSE:
+            {
+                result = llm.build_xverse();
+            } break;
         case LLM_ARCH_COMMAND_R:
             {
                 result = llm.build_command_r();
+            } break;
+        case LLM_ARCH_DBRX:
+            {
+                result = llm.build_dbrx();
+            } break;
+        case LLM_ARCH_OLMO:
+            {
+                result = llm.build_olmo();
+            } break;
+        case LLM_ARCH_GPTNEOX:
+            {
+                result = llm.build_gptneox();
+            } break;
+        case LLM_ARCH_ARCTIC:
+            {
+                result = llm.build_arctic();
+            } break;
+        case LLM_ARCH_DEEPSEEK2:
+            {
+                result = llm.build_deepseek2();
             } break;
         default:
             GGML_ASSERT(false);
@@ -9258,9 +11732,39 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         ggml_backend_tensor_set(lctx.inp_pos, batch.pos, 0, n_tokens*ggml_element_size(lctx.inp_pos));
     }
 
+    if (hparams.causal_attn || cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+        GGML_ASSERT(lctx.inp_out_ids && "every model that can must skip unused outputs");
+        const int64_t n_tokens = batch.n_tokens;
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_out_ids->buffer));
+        int32_t * data = (int32_t *) lctx.inp_out_ids->data;
+
+        if (lctx.n_outputs == n_tokens) {
+            for (int i = 0; i < n_tokens; ++i) {
+                data[i] = i;
+            }
+        } else if (batch.logits) {
+            int32_t n_outputs = 0;
+            for (int i = 0; i < n_tokens; ++i) {
+                if (batch.logits[i]) {
+                    data[n_outputs++] = i;
+                }
+            }
+            // the graph needs to have been passed the correct number of outputs
+            GGML_ASSERT(lctx.n_outputs == n_outputs);
+        } else if (lctx.n_outputs == 1) {
+            // only keep last output
+            data[0] = n_tokens - 1;
+        } else {
+            GGML_ASSERT(lctx.n_outputs == 0);
+        }
+    }
+
     GGML_ASSERT(
+        // (!a || b) is a logical implication (a -> b)
+        // !hparams.causal_attn -> !cparams.causal_attn
         (hparams.causal_attn || !cparams.causal_attn) &&
-        "non-causal attention with generative models is not supported"
+        "causal attention with embedding models is not supported"
     );
 
     if (lctx.inp_KQ_mask) {
@@ -9286,9 +11790,19 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                         if (!lctx.kv_self.cells[i].has_seq_id(seq_id) || lctx.kv_self.cells[i].pos > pos) {
                             f = -INFINITY;
                         } else {
-                            f = 0.0f;
+                            if (hparams.use_alibi) {
+                                f = -fabs(lctx.kv_self.cells[i].pos - pos);
+                            } else {
+                                f = 0.0f;
+                            }
                         }
                         data[h*(n_kv*n_tokens) + j*n_kv + i] = f;
+                    }
+                }
+
+                for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
+                    for (int j = 0; j < n_kv; ++j) {
+                        data[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
                     }
                 }
             }
@@ -9309,7 +11823,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                         float f = -INFINITY;
                         for (int s = 0; s < batch.n_seq_id[i]; ++s) {
                             if (batch.seq_id[i][s] == seq_id) {
-                                f = 0.0f;
+                                if (hparams.use_alibi) {
+                                    f = -fabs(batch.pos[i] - batch.pos[j]);
+                                } else {
+                                    f = 0.0f;
+                                }
                                 break;
                             }
                         }
@@ -9322,19 +11840,6 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     }
                 }
             }
-        }
-    }
-
-    if (hparams.need_kq_pos) {
-        const int64_t n_kv = kv_self.n;
-
-        GGML_ASSERT(lctx.inp_KQ_pos);
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_pos->buffer));
-
-        float * data = (float *) lctx.inp_KQ_pos->data;
-
-        for (int i = 0; i < n_kv; ++i) {
-            data[i] = float(lctx.kv_self.cells[i].pos);
         }
     }
 
@@ -9439,15 +11944,78 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     }
 }
 
+// Make sure enough space is available for outputs.
+// Returns max number of outputs for which space was reserved.
+static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
+    const auto & cparams = lctx.cparams;
+    const auto & hparams = lctx.model.hparams;
+
+    const size_t n_outputs_max = std::max(n_outputs, (size_t) cparams.n_seq_max);
+
+    const auto n_batch = cparams.n_batch;
+    const auto n_vocab = hparams.n_vocab;
+    const auto n_embd  = hparams.n_embd;
+
+    // TODO: use a per-batch flag for logits presence instead
+    const bool has_logits = cparams.causal_attn;
+    const bool has_embd   = cparams.embeddings && (hparams.causal_attn || cparams.pooling_type == LLAMA_POOLING_TYPE_NONE);
+
+    const size_t logits_size = has_logits ? n_vocab*n_outputs_max : 0;
+    const size_t embd_size   = has_embd   ?  n_embd*n_outputs_max : 0;
+
+    if (lctx.output_ids.empty()) {
+        // init, never resized afterwards
+        lctx.output_ids.resize(n_batch);
+    }
+
+    const size_t prev_size = lctx.buf_output ? ggml_backend_buffer_get_size(lctx.buf_output) : 0;
+    const size_t new_size  = (logits_size + embd_size) * sizeof(float);
+
+    // alloc only when more than the current capacity is required
+    // TODO: also consider shrinking the buffer
+    if (!lctx.buf_output || prev_size < new_size) {
+        if (lctx.buf_output) {
+#ifndef NDEBUG
+            // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
+            LLAMA_LOG_INFO("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+#endif
+            ggml_backend_buffer_free(lctx.buf_output);
+            lctx.buf_output = nullptr;
+            lctx.logits = nullptr;
+            lctx.embd = nullptr;
+        }
+
+        lctx.buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), new_size);
+        if (lctx.buf_output == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
+            return 0;
+        }
+    }
+
+    float * output_base = (float *) ggml_backend_buffer_get_base(lctx.buf_output);
+
+    lctx.logits = has_logits ? output_base               : nullptr;
+    lctx.embd   = has_embd   ? output_base + logits_size : nullptr;
+
+    lctx.output_size = n_outputs_max;
+    lctx.logits_size = logits_size;
+    lctx.embd_size   = embd_size;
+
+    // set all ids as invalid (negative)
+    std::fill(lctx.output_ids.begin(), lctx.output_ids.end(), -1);
+
+    ggml_backend_buffer_clear(lctx.buf_output, 0);
+
+    lctx.n_outputs = 0;
+
+    return n_outputs_max;
+}
+
+
 static void llama_graph_compute(
         llama_context & lctx,
           ggml_cgraph * gf,
                   int   n_threads) {
-#ifdef GGML_USE_MPI
-    const int64_t n_layer = lctx.model.hparams.n_layer;
-    ggml_mpi_graph_compute_pre(lctx.ctx_mpi, gf, n_layer);
-#endif
-
 #ifdef GGML_USE_METAL
     if (ggml_backend_is_metal(lctx.backend_metal)) {
         ggml_backend_metal_set_n_cb(lctx.backend_metal, n_threads);
@@ -9462,10 +12030,6 @@ static void llama_graph_compute(
     ggml_backend_sched_graph_compute_async(lctx.sched, gf);
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(lctx.sched));
-
-#ifdef GGML_USE_MPI
-    ggml_mpi_graph_compute_post(lctx.ctx_mpi, gf, n_layer);
-#endif
 }
 
 // decode a batch of tokens by evaluating the transformer
@@ -9503,27 +12067,13 @@ static int llama_decode_internal(
     }
     lctx.n_queued_tokens += n_tokens_all;
 
-#ifdef GGML_USE_MPI
-    // TODO: needs fix after #3228
-    GGML_ASSERT(false && "not implemented");
-    //ggml_mpi_eval_init(lctx.ctx_mpi, &n_tokens, &n_past, &n_threads);
-#endif
-
     auto & kv_self = lctx.kv_self;
 
     const int64_t n_embd  = hparams.n_embd;
     const int64_t n_vocab = hparams.n_vocab;
 
-
-    auto * logits_out = lctx.logits;
-
-#ifndef NDEBUG
-    auto & logits_valid = lctx.logits_valid;
-    logits_valid.clear();
-    logits_valid.resize(n_tokens_all);
-
-    memset(logits_out, 0, lctx.logits_size*sizeof(float));
-#endif
+    uint32_t n_outputs = 0;
+    uint32_t n_outputs_prev = 0;
 
     const auto n_ubatch = cparams.n_ubatch;
 
@@ -9531,6 +12081,38 @@ static int llama_decode_internal(
     std::vector<int32_t>                   n_seq_id;
     std::vector<llama_seq_id *>            seq_id_arr;
     std::vector<std::vector<llama_seq_id>> seq_id;
+
+    // count outputs
+    if (batch_all.logits) {
+        for (uint32_t i = 0; i < n_tokens_all; ++i) {
+            n_outputs += batch_all.logits[i] != 0;
+        }
+    } else if (lctx.logits_all || (cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+        n_outputs = n_tokens_all;
+    } else {
+        // keep last output only
+        n_outputs = 1;
+    }
+
+    // reserve output buffer
+    if (llama_output_reserve(lctx, n_outputs) < n_outputs) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_outputs);
+        return -2;
+    };
+
+    // set output mappings
+    if (batch_all.logits) {
+        int32_t i_logits = 0;
+        for (uint32_t i = 0; i < n_tokens_all; ++i) {
+            if (batch_all.logits[i]) {
+                lctx.output_ids[i] = i_logits++;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < n_outputs; ++i) {
+            lctx.output_ids[i] = i;
+        }
+    }
 
     for (uint32_t cur_token = 0; cur_token < n_tokens_all; cur_token += n_ubatch) {
         const uint32_t n_tokens = std::min(n_ubatch, n_tokens_all - cur_token);
@@ -9546,6 +12128,27 @@ static int llama_decode_internal(
             /* .all_pos_1  = */ batch_all.all_pos_1,
             /* .all_seq_id = */ batch_all.all_seq_id,
         };
+
+        // count the outputs in this u_batch
+        {
+            int32_t n_outputs_new = 0;
+
+            if (u_batch.logits) {
+                for (uint32_t i = 0; i < n_tokens; i++) {
+                    n_outputs_new += u_batch.logits[i] != 0;
+                }
+            } else if (n_outputs == n_tokens_all) {
+                n_outputs_new = n_tokens;
+            } else {
+                // keep last output only
+                if (cur_token + n_tokens >= n_tokens_all) {
+                    n_outputs_new = 1;
+                }
+            }
+
+            // needs to happen before the graph is built
+            lctx.n_outputs = n_outputs_new;
+        }
 
         int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
         GGML_ASSERT(n_threads > 0);
@@ -9594,7 +12197,8 @@ static int llama_decode_internal(
                 // a heuristic, to avoid attending the full cache if it is not yet utilized
                 // after enough generations, the benefit from this heuristic disappears
                 // if we start defragmenting the cache, the benefit from this will be more important
-                kv_self.n = std::min(kv_self.size, std::max(32u, GGML_PAD(llama_kv_cache_cell_max(kv_self), 32)));
+                const uint32_t pad = llama_kv_cache_get_padding(cparams);
+                kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(llama_kv_cache_cell_max(kv_self), pad)));
                 //kv_self.n = llama_kv_cache_cell_max(kv_self);
             }
         }
@@ -9610,23 +12214,37 @@ static int llama_decode_internal(
         struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
         struct ggml_tensor * embd = gf->nodes[gf->n_nodes - 2];
 
-        if (!hparams.causal_attn) {
+        if (lctx.n_outputs == 0) {
+            // no output
+            res  = nullptr;
+            embd = nullptr;
+        } else if (!hparams.causal_attn) {
             res = nullptr; // do not extract logits for embedding models such as BERT
 
             // token or sequence embeddings
             embd = gf->nodes[gf->n_nodes - 1];
 
             GGML_ASSERT(strcmp(embd->name, "result_embd") == 0 || strcmp(embd->name, "result_embd_pooled") == 0);
-        } else {
-            if (strcmp(res->name, "result_output") == 0) {
-                // the token embeddings could be the second to last tensor, or the third to last tensor
-                if (strcmp(embd->name, "result_norm") != 0) {
-                    embd = gf->nodes[gf->n_nodes - 3];
-                    GGML_ASSERT(strcmp(embd->name, "result_norm") == 0);
-                }
-            } else {
-                GGML_ASSERT(false && "missing result_output tensor");
+        } else if (cparams.embeddings) {
+            // the embeddings could be in the second to last tensor, or any of the previous tensors
+            int i_embd = gf->n_nodes - 2;
+            for (int i = 3; strcmp(embd->name, "result_norm") != 0; ++i) {
+                i_embd = gf->n_nodes - i;
+                if (i_embd < 0) { break; }
+                embd = gf->nodes[i_embd];
             }
+            GGML_ASSERT(i_embd >= 0 && "missing result_norm tensor");
+
+            // TODO: use a per-batch flag to know when to skip logits while keeping embeddings
+            if (!cparams.causal_attn) {
+                res = nullptr; // do not extract logits when not needed
+                // skip computing logits
+                // TODO: is this safe?
+                gf->n_nodes = i_embd + 1;
+            }
+        } else {
+            embd = nullptr; // do not extract embeddings when not needed
+            GGML_ASSERT(strcmp(res->name, "result_output") == 0 && "missing result_output tensor");
         }
         // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
 
@@ -9669,50 +12287,23 @@ static int llama_decode_internal(
         //}
 
         // extract logits
-        // TODO: do not compute and extract logits if only embeddings are needed
-        //       update the graphs to skip "result_output" if logits are not needed
         if (res) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
             GGML_ASSERT(backend_res != nullptr);
-            if (u_batch.logits) {
-                int32_t i_first = -1;
-                for (uint32_t i = 0; i < n_tokens; i++) {
-                    if (u_batch.logits[i] && i_first == -1) {
-                        i_first = (int32_t) i;
-                    }
-                    if (u_batch.logits[i] == 0 || i == n_tokens - 1) {
-                        if (i_first != -1) {
-                            int i_last = u_batch.logits[i] == 0 ? i : i + 1;
-                            // extract logits for the range [i_first, i_last)
-                            // group the requests to minimize the number of calls to the backend
-                            ggml_backend_tensor_get_async(backend_res, res,
-                                logits_out + n_vocab*(cur_token + i_first),
-                                i_first*n_vocab*sizeof(float),
-                                (i_last - i_first)*n_vocab*sizeof(float));
-                            i_first = -1;
-                        }
-                    }
-#ifndef NDEBUG
-                    logits_valid[cur_token + i] = u_batch.logits[i] != 0;;
-#endif
-                }
-            } else if (lctx.logits_all) {
-                ggml_backend_tensor_get_async(backend_res, res, logits_out + n_vocab*cur_token, 0, n_vocab*n_tokens*sizeof(float));
-#ifndef NDEBUG
-                std::fill(logits_valid.begin() + cur_token, logits_valid.begin() + cur_token + n_tokens, true);
-#endif
-            } else {
-                if (cur_token + n_tokens >= n_tokens_all) {
-                    ggml_backend_tensor_get_async(backend_res, res, logits_out, n_vocab*(n_tokens - 1)*sizeof(float), n_vocab*sizeof(float));
-#ifndef NDEBUG
-                    logits_valid[0] = true;
-#endif
-                }
+            GGML_ASSERT(lctx.logits != nullptr);
+
+            float * logits_out = lctx.logits + n_outputs_prev*n_vocab;
+            const int32_t n_outputs_new = lctx.n_outputs;
+
+            if (n_outputs_new) {
+                GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
+                GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
+                ggml_backend_tensor_get_async(backend_res, res, logits_out, 0, n_outputs_new*n_vocab*sizeof(float));
             }
         }
 
         // extract embeddings
-        if (cparams.embeddings && embd) {
+        if (embd) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -9720,16 +12311,14 @@ static int llama_decode_internal(
                 case LLAMA_POOLING_TYPE_NONE:
                     {
                         // extract token embeddings
-                        auto & embd_out = lctx.embd;
+                        GGML_ASSERT(lctx.embd != nullptr);
+                        float * embd_out = lctx.embd + n_outputs_prev*n_embd;
+                        const int32_t n_outputs_new = lctx.n_outputs;
 
-                        if (u_batch.logits) {
-                            //embd_out.resize(n_embd * n_tokens);
-                            for (uint32_t i = 0; i < n_tokens; i++) {
-                                if (u_batch.logits[i] == 0) {
-                                    continue;
-                                }
-                                ggml_backend_tensor_get_async(backend_embd, embd, embd_out + n_embd*(i + cur_token), (n_embd*i)*sizeof(float), n_embd*sizeof(float));
-                            }
+                        if (n_outputs_new) {
+                            GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
+                            GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_embd <= (int64_t) lctx.embd_size);
+                            ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_outputs_new*n_embd*sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_CLS:
@@ -9756,7 +12345,11 @@ static int llama_decode_internal(
                     } break;
             }
         }
+        n_outputs_prev += lctx.n_outputs;
     }
+
+    // set to total number of outputs in the batch, for use in llama_get_logits_ith
+    lctx.n_outputs = n_outputs;
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //llama_synchronize(&lctx);
@@ -9772,6 +12365,10 @@ static int llama_decode_internal(
             llama_kv_cache_defrag(kv_self);
         }
     }
+
+    // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
+    // overlap with device computation.
+    ggml_backend_sched_reset(lctx.sched);
 
     return 0;
 }
@@ -9798,7 +12395,9 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     // each move requires 6*n_layer tensors (see build_defrag)
     //   - source view, destination view, copy operation
     //   - x2 for keys and values
-    const uint32_t max_moves = LLAMA_MAX_NODES/(6*n_layer);
+    //const uint32_t max_moves = LLAMA_MAX_NODES/(6*n_layer);
+    // TODO: tmp fix https://github.com/ggerganov/llama.cpp/issues/6685#issuecomment-2057579516
+    const uint32_t max_moves = (LLAMA_MAX_NODES - 2*n_layer)/(6*n_layer);
 
     // determine which KV cells to move where
     //
@@ -10088,33 +12687,33 @@ static enum llama_vocab_type llama_vocab_get_type(const llama_vocab & vocab) {
 
 static bool llama_is_normal_token(const llama_vocab & vocab, llama_token id) {
     GGML_ASSERT(vocab.type != LLAMA_VOCAB_TYPE_NONE);
-    return vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_NORMAL;
+    return vocab.id_to_token[id].attr & LLAMA_TOKEN_ATTR_NORMAL;
 }
 
 static bool llama_is_unknown_token(const llama_vocab & vocab, llama_token id) {
     GGML_ASSERT(vocab.type != LLAMA_VOCAB_TYPE_NONE);
-    return vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_UNKNOWN;
+    return vocab.id_to_token[id].attr & LLAMA_TOKEN_ATTR_UNKNOWN;
 }
 
 static bool llama_is_control_token(const llama_vocab & vocab, llama_token id) {
     GGML_ASSERT(vocab.type != LLAMA_VOCAB_TYPE_NONE);
-    return vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_CONTROL;
+    return vocab.id_to_token[id].attr & LLAMA_TOKEN_ATTR_CONTROL;
 }
 
 static bool llama_is_byte_token(const llama_vocab & vocab, llama_token id) {
     GGML_ASSERT(vocab.type != LLAMA_VOCAB_TYPE_NONE);
-    return vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_BYTE;
+    return vocab.id_to_token[id].attr & LLAMA_TOKEN_ATTR_BYTE;
 }
 
 static bool llama_is_user_defined_token(const llama_vocab& vocab, llama_token id) {
     GGML_ASSERT(vocab.type != LLAMA_VOCAB_TYPE_NONE);
-    return vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_USER_DEFINED;
+    return vocab.id_to_token[id].attr & LLAMA_TOKEN_ATTR_USER_DEFINED;
 }
 
 static uint8_t llama_token_to_byte(const llama_vocab& vocab, llama_token id) {
     GGML_ASSERT(llama_vocab_get_type(vocab) != LLAMA_VOCAB_TYPE_NONE);
     GGML_ASSERT(llama_is_byte_token(vocab, id));
-    const auto& token_data = vocab.id_to_token.at(id);
+    const auto & token_data = vocab.id_to_token.at(id);
     switch (llama_vocab_get_type(vocab)) {
         case LLAMA_VOCAB_TYPE_SPM: {
             auto buf = token_data.text.substr(3, 2);
@@ -10122,7 +12721,7 @@ static uint8_t llama_token_to_byte(const llama_vocab& vocab, llama_token id) {
         }
         case LLAMA_VOCAB_TYPE_BPE: {
             GGML_ASSERT(false);
-            return unicode_utf8_to_byte(token_data.text);
+            return unicode_utf8_to_byte(token_data.text); // TODO: why is this here after GGML_ASSERT?
         }
         case LLAMA_VOCAB_TYPE_WPM: {
             GGML_ASSERT(false);
@@ -10344,7 +12943,103 @@ struct llm_tokenizer_bpe {
 
     void tokenize(const std::string & text, std::vector<llama_vocab::id> & output) {
         int final_prev_index = -1;
-        auto word_collection = bpe_gpt2_preprocess(text);
+        bool ignore_merges = false;
+
+        std::vector<std::string> word_collection;
+        switch (vocab.type) {
+            case LLAMA_VOCAB_TYPE_BPE:
+                switch (vocab.type_pre) {
+                    case LLAMA_VOCAB_PRE_TYPE_LLAMA3:
+                        ignore_merges = true;
+                        word_collection = unicode_regex_split(text, {
+                            // original regex from tokenizer.json
+                            //"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+
+                            // adapted: https://github.com/ggerganov/llama.cpp/pull/6920#issuecomment-2080233989
+                            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                        });
+                        break;
+                    case LLAMA_VOCAB_PRE_TYPE_DBRX:
+                    case LLAMA_VOCAB_PRE_TYPE_SMAUG:
+                        word_collection = unicode_regex_split(text, {
+                            // same as llama3
+                            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                        });
+                        break;
+                    case LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM:
+                        word_collection = unicode_regex_split(text, {
+                            "[\r\n]",
+                            "\\s?[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-ώᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐ-ΐῖ-Ίῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃]+",
+                            "\\s?[!-/:-~！-／：-～‘-‟　-。]+",
+                            "\\s+$",
+                            "[一-龥ࠀ-一가-퟿]+",
+                            "\\p{N}+",
+                        });
+                        break;
+                    case LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_CODER:
+                        word_collection = unicode_regex_split(text, {
+                            "[\r\n]",
+                            "\\s?\\p{L}+",
+                            "\\s?\\p{P}+",
+                            "[一-龥ࠀ-一가-퟿]+",
+                            "\\p{N}",
+                        });
+                        break;
+                    case LLAMA_VOCAB_PRE_TYPE_FALCON:
+                        word_collection = unicode_regex_split(text, {
+                            "[\\p{P}\\$\\+<=>\\^~\\|]+",
+                            "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+                            "[0-9][0-9][0-9]",
+                        });
+                        break;
+                    case LLAMA_VOCAB_PRE_TYPE_MPT:
+                        // TODO: MPT pre-tokenization regexes are unknown
+                        //       the following are close, but not exact. run the following:
+                        //       ./bin/test-tokenizer-0 ../models/ggml-vocab-mpt.gguf
+                        GGML_ASSERT("MPT pre-tokenization regexes are unknown - fixes needed");
+                        word_collection = unicode_regex_split(text, {
+                            "\\s?\\p{L}+",
+                            "\\s?\\p{P}+",
+                            "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+                        });
+                        break;
+                    case LLAMA_VOCAB_PRE_TYPE_STARCODER:
+                    case LLAMA_VOCAB_PRE_TYPE_REFACT:
+                    case LLAMA_VOCAB_PRE_TYPE_COMMAND_R:
+                        word_collection = unicode_regex_split(text, {
+                            "\\p{N}",
+                            "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+                        });
+                        break;
+                    case LLAMA_VOCAB_PRE_TYPE_GPT2:
+                    case LLAMA_VOCAB_PRE_TYPE_OLMO:
+                        word_collection = unicode_regex_split(text, {
+                            "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+                        });
+                        break;
+                    case LLAMA_VOCAB_PRE_TYPE_STABLELM2:
+                    case LLAMA_VOCAB_PRE_TYPE_QWEN2:
+                        word_collection = unicode_regex_split(text, {
+                            // original regex from tokenizer.json
+                            // "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+                            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                        });
+                        break;
+                    default:
+                        // default regex for BPE tokenization pre-processing
+                        word_collection = unicode_regex_split(text, {
+                            "[\\p{P}\\$\\+<=>\\^~\\|]+",
+                            "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+                            "\\p{N}+",
+                            "[0-9][0-9][0-9]",
+                        });
+                        break;
+                }
+                break;
+            default:
+                GGML_ASSERT(false);
+                break;
+        }
 
         symbols_final.clear();
 
@@ -10354,6 +13049,11 @@ struct llm_tokenizer_bpe {
 
             int index = 0;
             size_t offset = 0;
+
+            if (ignore_merges && vocab.token_to_id.find(word) != vocab.token_to_id.end()) {
+                symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
+                offset = word.size();
+            }
 
             while (offset < word.size()) {
                 llm_symbol sym;
@@ -10401,7 +13101,7 @@ struct llm_tokenizer_bpe {
                 add_new_bigram(bigram.left, left_symbol.next);  // right side of current symbol
             }
 
-            // add the fnished tokens to the final list keeping correct order for next and prev
+            // add the finished tokens to the final list keeping correct order for next and prev
             for (auto & sym : symbols) {
                 if (sym.n > 0) {
                     sym.prev = final_prev_index;
@@ -10471,145 +13171,6 @@ private:
         work_queue.push(bigram);
     }
 
-    std::vector<std::string> bpe_gpt2_preprocess(const std::string & text) {
-        std::vector<std::string> bpe_words;
-        std::vector<std::string> bpe_encoded_words;
-
-        std::string token = "";
-        // GPT2 system regex:  's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
-        bool collecting_numeric = false;
-        bool collecting_letter = false;
-        bool collecting_special = false;
-        bool collecting_whitespace_lookahead = false;
-        bool collecting = false;
-
-        std::vector<std::string> text_utf;
-        text_utf.reserve(text.size());
-        bpe_words.reserve(text.size());
-        bpe_encoded_words.reserve(text.size());
-
-        const auto cpts = unicode_cpts_from_utf8(text);
-        for (size_t i = 0; i < cpts.size(); ++i)
-            text_utf.emplace_back(unicode_cpt_to_utf8(cpts[i]));
-
-        for (int i = 0; i < (int)text_utf.size(); i++) {
-            const std::string & utf_char = text_utf[i];
-            bool split_condition = false;
-            int bytes_remain = text_utf.size() - i;
-            // forward backward lookups
-            const std::string & utf_char_next = (i + 1 < (int)text_utf.size()) ? text_utf[i + 1] : "";
-            const std::string & utf_char_next_next = (i + 2 < (int)text_utf.size()) ? text_utf[i + 2] : "";
-
-            // handling contractions
-            if (!split_condition && bytes_remain >= 2) {
-                // 's|'t|'m|'d
-                if (utf_char == "\'" && (utf_char_next == "s" || utf_char_next == "t" || utf_char_next == "m" || utf_char_next == "d")) {
-                    split_condition = true;
-                }
-                if (split_condition) {
-                    if (token.size()) {
-                        bpe_words.emplace_back(token); // push previous content as token
-                    }
-                    token = utf_char + utf_char_next;
-                    bpe_words.emplace_back(token);
-                    token = "";
-                    i++;
-                    continue;
-                }
-            }
-            if (!split_condition && bytes_remain >= 3) {
-                // 're|'ve|'ll
-                if (utf_char == "\'" && (
-                    (utf_char_next == "r" && utf_char_next_next == "e") ||
-                    (utf_char_next == "v" && utf_char_next_next == "e") ||
-                    (utf_char_next == "l" && utf_char_next_next == "l"))
-                    ) {
-                    split_condition = true;
-                }
-                if (split_condition) {
-                    // current token + next token can be defined
-                    if (token.size()) {
-                        bpe_words.emplace_back(token); // push previous content as token
-                    }
-                    token = utf_char + utf_char_next + utf_char_next_next;
-                    bpe_words.emplace_back(token); // the contraction
-                    token = "";
-                    i += 2;
-                    continue;
-                }
-            }
-
-            if (!split_condition && !collecting) {
-                if (unicode_cpt_type(utf_char) == CODEPOINT_TYPE_LETTER || (!token.size() && utf_char == " " && unicode_cpt_type(utf_char_next) == CODEPOINT_TYPE_LETTER)) {
-                    collecting_letter = true;
-                    collecting = true;
-                }
-                else if (unicode_cpt_type(utf_char) == CODEPOINT_TYPE_DIGIT || (!token.size() && utf_char == " " && unicode_cpt_type(utf_char_next) == CODEPOINT_TYPE_DIGIT)) {
-                    collecting_numeric = true;
-                    collecting = true;
-                }
-                else if (
-                    ((unicode_cpt_type(utf_char) != CODEPOINT_TYPE_LETTER && unicode_cpt_type(utf_char) != CODEPOINT_TYPE_DIGIT) && (unicode_cpt_type(utf_char) != CODEPOINT_TYPE_WHITESPACE)) ||
-                    (!token.size() && utf_char == " " && unicode_cpt_type(utf_char_next) != CODEPOINT_TYPE_LETTER && unicode_cpt_type(utf_char_next) != CODEPOINT_TYPE_DIGIT && unicode_cpt_type(utf_char_next) != CODEPOINT_TYPE_WHITESPACE)
-                    ) {
-                    collecting_special = true;
-                    collecting = true;
-                }
-                else if (unicode_cpt_type(utf_char) == CODEPOINT_TYPE_WHITESPACE && unicode_cpt_type(utf_char_next) == CODEPOINT_TYPE_WHITESPACE) {
-                    collecting_whitespace_lookahead = true;
-                    collecting = true;
-                }
-                else if (unicode_cpt_type(utf_char) == CODEPOINT_TYPE_WHITESPACE) {
-                    split_condition = true;
-                }
-            }
-            else if (!split_condition && collecting) {
-                if (collecting_letter && unicode_cpt_type(utf_char) != CODEPOINT_TYPE_LETTER) {
-                    split_condition = true;
-                }
-                else if (collecting_numeric && unicode_cpt_type(utf_char) != CODEPOINT_TYPE_DIGIT) {
-                    split_condition = true;
-                }
-                else if (collecting_special && (unicode_cpt_type(utf_char) == CODEPOINT_TYPE_LETTER || unicode_cpt_type(utf_char) == CODEPOINT_TYPE_DIGIT || unicode_cpt_type(utf_char) == CODEPOINT_TYPE_WHITESPACE)) {
-                    split_condition = true;
-                }
-                else if (collecting_whitespace_lookahead && (unicode_cpt_type(utf_char_next) == CODEPOINT_TYPE_LETTER || unicode_cpt_type(utf_char_next) == CODEPOINT_TYPE_DIGIT)) {
-                    split_condition = true;
-                }
-            }
-
-            if (utf_char_next == "") {
-                split_condition = true; // final
-                token += utf_char;
-            }
-
-            if (split_condition) {
-                if (token.size()) {
-                    bpe_words.emplace_back(token);
-                }
-                token = utf_char;
-                collecting = false;
-                collecting_letter = false;
-                collecting_numeric = false;
-                collecting_special = false;
-                collecting_whitespace_lookahead = false;
-            }
-            else {
-                token += utf_char;
-            }
-        }
-
-        for (std::string & word : bpe_words) {
-            std::string encoded_token = "";
-            for (char & c : word) {
-                encoded_token += unicode_byte_to_utf8(c);
-            }
-            bpe_encoded_words.emplace_back(encoded_token);
-        }
-
-        return bpe_encoded_words;
-    }
-
     const llama_vocab & vocab;
 
     std::vector<llm_symbol> symbols;
@@ -10622,7 +13183,7 @@ struct llm_tokenizer_wpm {
     llm_tokenizer_wpm(const llama_vocab & vocab): vocab(vocab) {}
 
     void tokenize(const std::string & text, std::vector<llama_vocab::id> & output) {
-        auto * token_map = &vocab.token_to_id;
+        const auto & token_map = vocab.token_to_id;
 
         // normalize and split by whitespace
         std::vector<std::string> words = preprocess(text);
@@ -10637,117 +13198,89 @@ struct llm_tokenizer_wpm {
             }
 
             // prepend phantom space
-            std::string word1 = "\xe2\x96\x81" + word;
-            int n = word1.size();
+            const std::string word1 = "\xe2\x96\x81" + word;
+            const int n = word1.size();
+
+            const size_t current_tokens = output.size();
 
             // we're at the start of a new word
-            int i = 0;
-            bool match_any = false;
-
             // move through character position in word
-            while (i < n) {
+            for (int i = 0; i < n; ++i) {
                 // loop through possible match length
                 bool match = false;
                 for (int j = n; j > i; j--) {
-                    auto it = token_map->find(word1.substr(i, j - i));
-                    if (it != token_map->end()) {
+                    auto it = token_map.find(word1.substr(i, j - i));
+                    if (it != token_map.end()) {
                         output.push_back(it->second);
                         match = true;
-                        match_any = true;
-                        i = j;
+                        i = j - 1;
                         break;
                     }
                 }
 
-                // must be an unknown character
-                if (!match) {
-                    i++;
+                if (!match) { // discard all
+                    output.resize(current_tokens);
+                    break;  // and discard next tokens
                 }
             }
 
             // we didn't find any matches for this word
-            if (!match_any) {
+            if (current_tokens == output.size()) {
                 output.push_back(vocab.special_unk_id);
             }
         }
-
-        // append eos token
-        output.push_back(vocab.special_eos_id);
     }
 
     std::vector<std::string> preprocess(const std::string & text) {
-        std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
+        const std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
+        std::vector<std::string> words(1, "");
 
-        // strip accents, strip control, uniformize whitespace,
-        // to lowercase, pad chinese characters, pad punctuation
-        std::string new_str = "";
-        for (uint32_t code : cpts_nfd) {
-            int type = unicode_cpt_type(code);
-            if (type == CODEPOINT_TYPE_ACCENT_MARK || type == CODEPOINT_TYPE_CONTROL) {
+        for (const char32_t cpt : cpts_nfd) {
+            const auto flags = unicode_cpt_flags(cpt);
+
+            if (flags.is_whitespace) {
+                if (words.back().size()) {  // finish previous word if any
+                    words.emplace_back();
+                }
                 continue;
             }
-            code = to_lower(code);
-            if (type == CODEPOINT_TYPE_WHITESPACE) {
-                code = ' ';
+
+            assert (!flags.is_separator);
+            if (cpt == 0 || cpt == 0xFFFD || flags.is_control) {
+                continue;
             }
-            std::string s = unicode_cpt_to_utf8(code);
-            if (type == CODEPOINT_TYPE_PUNCTUATION || is_ascii_punct(code) || is_chinese_char(code)) {
-                new_str += " ";
-                new_str += s;
-                new_str += " ";
+
+            const std::string s = unicode_cpt_to_utf8(unicode_tolower(cpt));
+            if (flags.is_punctuation || ( cpt < 0x7F && flags.is_symbol ) || is_chinese_char(cpt)) {
+                if (words.back().size()) {  // finish previous word if any
+                    words.emplace_back();
+                }
+                words.back() = s;       // single char word
+                words.emplace_back();   // start a new word
             } else {
-                new_str += s;
+                words.back() += s;  // append char to word
             }
         }
 
-        // split by whitespace
-        uint64_t l = 0;
-        uint64_t r = 0;
-        std::vector<std::string> words;
-        while (r < new_str.size()) {
-            // if is whitespace
-            if (isspace(new_str[r])) {
-                if (r > l) words.push_back(new_str.substr(l, (r - l)));
-                l = r + 1;
-                r = l;
-            } else {
-                r += 1;
-            }
+        if (!words.back().size()) {
+            words.pop_back();
         }
-        if (r > l) {
-            words.push_back(new_str.substr(l, (r - l)));
-        }
+
         return words;
     }
 
-    uint32_t to_lower(uint32_t code) {
-        static const std::locale locale("en_US.UTF-8");
-#if defined(_WIN32)
-        if (code > 0xFFFF) {
-            return code;
-        }
-#endif
-        return std::tolower(wchar_t(code), locale);
-    }
-
-    bool is_ascii_punct(uint32_t code) {
-        return code < 256 && ispunct(code);
-    }
-
-    bool is_chinese_char(uint32_t cpt) {
-        if ((cpt >= 0x4E00  && cpt <= 0x9FFF)  ||
-            (cpt >= 0x3400  && cpt <= 0x4DBF)  ||
+    static bool is_chinese_char(uint32_t cpt) {
+        return
+            (cpt >= 0x04E00 && cpt <= 0x09FFF) ||
+            (cpt >= 0x03400 && cpt <= 0x04DBF) ||
             (cpt >= 0x20000 && cpt <= 0x2A6DF) ||
             (cpt >= 0x2A700 && cpt <= 0x2B73F) ||
             (cpt >= 0x2B740 && cpt <= 0x2B81F) ||
             (cpt >= 0x2B920 && cpt <= 0x2CEAF) || // this should be 0x2B820 but in hf rust code it is 0x2B920
-            (cpt >= 0xF900  && cpt <= 0xFAFF)  ||
-            (cpt >= 0x2F800 && cpt <= 0x2FA1F) ||
-            (cpt >= 0x3000  && cpt <= 0x303F)  ||
-            (cpt >= 0xFF00  && cpt <= 0xFFEF)) {
-            return true; // NOLINT
-        }
-        return false;
+            (cpt >= 0x0F900 && cpt <= 0x0FAFF) ||
+            (cpt >= 0x2F800 && cpt <= 0x2FA1F);
+            //(cpt >= 0x3000  && cpt <= 0x303F)  ||
+            //(cpt >= 0xFF00  && cpt <= 0xFFEF);
     }
 
     const llama_vocab & vocab;
@@ -10791,9 +13324,9 @@ struct fragment_buffer_variant {
 
 static void tokenizer_st_partition(const llama_vocab & vocab, std::forward_list<fragment_buffer_variant> & buffer) {
     // for each special token
-    for (const auto & st: vocab.special_tokens_cache) {
-        const auto & special_token = st.first;
-        const auto & special_id    = st.second;
+    for (const llama_vocab::id special_id : vocab.cache_special_tokens) {
+        const auto & data = vocab.id_to_token[special_id];
+        const auto & special_token = data.text;
 
         // for each text fragment
         std::forward_list<fragment_buffer_variant>::iterator it = buffer.begin();
@@ -10802,7 +13335,7 @@ static void tokenizer_st_partition(const llama_vocab & vocab, std::forward_list<
 
             // if a fragment is text ( not yet processed )
             if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
-                auto * raw_text = &(fragment.raw_text);
+                auto & raw_text = fragment.raw_text;
 
                 auto raw_text_base_offset = fragment.offset;
                 auto raw_text_base_length = fragment.length;
@@ -10812,7 +13345,7 @@ static void tokenizer_st_partition(const llama_vocab & vocab, std::forward_list<
                     // find the first occurrence of a given special token in this fragment
                     //  passing offset argument only limit the "search area" but match coordinates
                     //  are still relative to the source full raw_text
-                    auto match = raw_text->find(special_token, raw_text_base_offset);
+                    auto match = raw_text.find(special_token, raw_text_base_offset);
 
                     // no occurrences found, stop processing this fragment for a given special token
                     if (match == std::string::npos) break;
@@ -10830,13 +13363,22 @@ static void tokenizer_st_partition(const llama_vocab & vocab, std::forward_list<
                     if (match > raw_text_base_offset) {
                         // left
                         const int64_t left_reminder_offset = raw_text_base_offset + 0;
-                        const int64_t left_reminder_length = match - raw_text_base_offset;
-                        buffer.emplace_after(it, (*raw_text), left_reminder_offset, left_reminder_length);
+                        int64_t left_reminder_length = match - raw_text_base_offset;
+
+                        if (data.attr & LLAMA_TOKEN_ATTR_LSTRIP) {
+                            while (left_reminder_length > 0 && isspace(raw_text[left_reminder_offset + left_reminder_length - 1])) {
+                                left_reminder_length--;
+                            }
+                        }
+
+                        if (left_reminder_length > 0) {
+                            buffer.emplace_after(it, raw_text, left_reminder_offset, left_reminder_length);
+                            it++;
+                        }
 
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("FL: (%ld %ld) '%s'\n", left_reminder_offset, left_reminder_length, raw_text->substr(left_reminder_offset, left_reminder_length).c_str());
 #endif
-                        it++;
                     }
 
                     // special token
@@ -10845,15 +13387,24 @@ static void tokenizer_st_partition(const llama_vocab & vocab, std::forward_list<
 
                     // right
                     if (match + special_token.length() < raw_text_base_offset + raw_text_base_length) {
-                        const int64_t right_reminder_offset = match + special_token.length();
-                        const int64_t right_reminder_length = raw_text_base_length - ((match - raw_text_base_offset) + special_token.length());
-                        buffer.emplace_after(it, (*raw_text), right_reminder_offset, right_reminder_length);
+                        int64_t right_reminder_offset = match + special_token.length();
+                        int64_t right_reminder_length = raw_text_base_length - ((match - raw_text_base_offset) + special_token.length());
+
+                        if (data.attr & LLAMA_TOKEN_ATTR_RSTRIP) {
+                            while (right_reminder_length > 0 && isspace(raw_text[right_reminder_offset])) {
+                                right_reminder_offset++;
+                                right_reminder_length--;
+                            }
+                        }
+
+                        if (right_reminder_length > 0) {
+                            buffer.emplace_after(it, raw_text, right_reminder_offset, right_reminder_length);
+                            it++;
+                        }
 
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("FR: (%ld %ld) '%s'\n", right_reminder_offset, right_reminder_length, raw_text->substr(right_reminder_offset, right_reminder_length).c_str());
 #endif
-
-                        it++;
 
                         if (source == 0) {
                             buffer.erase_after(buffer.before_begin());
@@ -10883,42 +13434,38 @@ static void tokenizer_st_partition(const llama_vocab & vocab, std::forward_list<
     }
 }
 
-static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & vocab, std::string raw_text, bool bos, bool special) {
+static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & vocab, std::string raw_text, bool add_special, bool parse_special) {
     std::vector<llama_vocab::id> output;
-
-    // OG tokenizer behavior:
-    //
-    // tokenizer.encode('', add_bos=True)  returns [1]
-    // tokenizer.encode('', add_bos=False) returns []
-
-    if (bos && vocab.special_bos_id != -1) {
-        output.push_back(vocab.special_bos_id);
-    }
-
-    if (raw_text.empty()) {
-        return output;
-    }
-
     std::forward_list<fragment_buffer_variant> fragment_buffer;
-    fragment_buffer.emplace_front(raw_text, 0, raw_text.length());
 
-    if (special) tokenizer_st_partition(vocab, fragment_buffer);
+    if (!raw_text.empty()) {
+        fragment_buffer.emplace_front(raw_text, 0, raw_text.length());
+        if (parse_special) tokenizer_st_partition(vocab, fragment_buffer);
+    }
 
     switch (vocab.type) {
         case LLAMA_VOCAB_TYPE_SPM:
             {
+                // OG tokenizer behavior:
+                //
+                // tokenizer.encode('', add_special_tokens=True)  returns [1]
+                // tokenizer.encode('', add_special_tokens=False) returns []
+
+                bool is_prev_special = false;
+
+                if (add_special && vocab.special_add_bos != 0) {
+                    GGML_ASSERT(vocab.special_bos_id != -1);
+                    output.push_back(vocab.special_bos_id);
+                    is_prev_special = true;
+                }
+
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
-                        // without adding this leading whitespace, we do not get the same results as the original tokenizer
-
-                        // TODO: It's likely possible to get rid of this string copy entirely
-                        //  by modifying llm_tokenizer_x to operate with string offsets like pre-tokenizer
-                        //  and passing 'add space prefix' as bool argument
-                        //
                         auto raw_text = fragment.raw_text.substr(fragment.offset, fragment.length);
-                        if (&fragment == &fragment_buffer.front()) {
-                            if (vocab.add_space_prefix) {
-                                raw_text = " " + raw_text; // prefix with space if the first token is not special
+
+                        if (vocab.add_space_prefix) {
+                            if (!output.size() || is_prev_special) {  // prefix with space if first token
+                                raw_text = " " + raw_text;
                             }
                         }
 
@@ -10930,11 +13477,29 @@ static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & 
                         tokenizer.tokenize(raw_text, output);
                     } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
                         output.push_back(fragment.token);
+                        is_prev_special = true;
                     }
+                }
+
+                if (add_special && vocab.special_add_bos != 0 && output.size() >= 2 && output[1] == vocab.special_bos_id) {
+                    LLAMA_LOG_WARN(
+                        "%s: Added a BOS token to the prompt as specified by the model but the prompt "
+                        "also starts with a BOS token. So now the final prompt starts with 2 BOS tokens. "
+                        "Are you sure this is what you want?\n", __FUNCTION__);
+                }
+
+                if (add_special && vocab.special_add_eos == 1) {
+                    GGML_ASSERT(vocab.special_eos_id != -1);
+                    output.push_back(vocab.special_eos_id);
                 }
             } break;
         case LLAMA_VOCAB_TYPE_BPE:
             {
+                if (add_special && vocab.special_add_bos != 0) {
+                    GGML_ASSERT(vocab.special_bos_id != -1);
+                    output.push_back(vocab.special_bos_id);
+                }
+
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         auto raw_text = fragment.raw_text.substr(fragment.offset, fragment.length);
@@ -10948,9 +13513,26 @@ static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & 
                         output.push_back(fragment.token);
                     }
                 }
+
+                if (add_special && vocab.special_add_bos != 0 && output.size() >= 2 && output[1] == vocab.special_bos_id) {
+                    LLAMA_LOG_WARN(
+                        "%s: Added a BOS token to the prompt as specified by the model but the prompt "
+                        "also starts with a BOS token. So now the final prompt starts with 2 BOS tokens. "
+                        "Are you sure this is what you want?\n", __FUNCTION__);
+                }
+
+                if (add_special && vocab.special_add_eos == 1) {
+                    GGML_ASSERT(vocab.special_add_eos != -1);
+                    output.push_back(vocab.special_eos_id);
+                }
             } break;
         case LLAMA_VOCAB_TYPE_WPM:
             {
+                if (add_special) {
+                    GGML_ASSERT(vocab.special_cls_id != -1);
+                    output.push_back(vocab.special_cls_id);
+                }
+
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         auto raw_text = fragment.raw_text.substr(fragment.offset, fragment.length);
@@ -10964,6 +13546,11 @@ static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & 
                         output.push_back(fragment.token);
                     }
                 }
+
+                if (add_special) {
+                    GGML_ASSERT(vocab.special_sep_id != -1);
+                    output.push_back(vocab.special_sep_id);
+                }
             } break;
         case LLAMA_VOCAB_TYPE_NONE:
             GGML_ASSERT(false);
@@ -10976,28 +13563,10 @@ static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & 
 // grammar - internal
 //
 
-struct llama_partial_utf8 {
-    uint32_t value;    // bit value so far (unshifted)
-    int      n_remain; // num bytes remaining; -1 indicates invalid sequence
-};
-
-struct llama_grammar {
-    const std::vector<std::vector<llama_grammar_element>>   rules;
-    std::vector<std::vector<const llama_grammar_element *>> stacks;
-
-    // buffer for partially generated UTF-8 sequence from accepted tokens
-    llama_partial_utf8                                      partial_utf8;
-};
-
-struct llama_grammar_candidate {
-    size_t               index;
-    const uint32_t     * code_points;
-    llama_partial_utf8   partial_utf8;
-};
 
 // Decodes a UTF-8 string which may end in an incomplete sequence. Adds a terminating 0 for use as
 // pointer. If an invalid sequence is encountered, returns `llama_partial_utf8.n_remain == -1`.
-static std::pair<std::vector<uint32_t>, llama_partial_utf8> decode_utf8(
+std::pair<std::vector<uint32_t>, llama_partial_utf8> decode_utf8(
         const std::string & src,
         llama_partial_utf8   partial_start) {
     static const int      lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4 };
@@ -11071,7 +13640,7 @@ static std::pair<bool, const llama_grammar_element *> llama_grammar_match_char(
         const uint32_t                chr) {
 
     bool found            = false;
-    bool is_positive_char = pos->type == LLAMA_GRETYPE_CHAR;
+    bool is_positive_char = pos->type == LLAMA_GRETYPE_CHAR || pos->type == LLAMA_GRETYPE_CHAR_ANY;
 
     GGML_ASSERT(is_positive_char || pos->type == LLAMA_GRETYPE_CHAR_NOT); // NOLINT
 
@@ -11080,6 +13649,10 @@ static std::pair<bool, const llama_grammar_element *> llama_grammar_match_char(
             // inclusive range, e.g. [a-z]
             found = found || (pos->value <= chr && chr <= pos[1].value);
             pos += 2;
+        } else if (pos->type == LLAMA_GRETYPE_CHAR_ANY) {
+            // Any character matches "."
+            found = true;
+            pos += 1;
         } else {
             // exact char match, e.g. [a] or "a"
             found = found || pos->value == chr;
@@ -11097,7 +13670,7 @@ static bool llama_grammar_match_partial_char(
         const llama_grammar_element * pos,
         const llama_partial_utf8      partial_utf8) {
 
-    bool is_positive_char = pos->type == LLAMA_GRETYPE_CHAR;
+    bool is_positive_char = pos->type == LLAMA_GRETYPE_CHAR || pos->type == LLAMA_GRETYPE_CHAR_ANY;
     GGML_ASSERT(is_positive_char || pos->type == LLAMA_GRETYPE_CHAR_NOT);
 
     uint32_t partial_value = partial_utf8.value;
@@ -11127,6 +13700,9 @@ static bool llama_grammar_match_partial_char(
                 return is_positive_char;
             }
             pos += 2;
+        } else if (pos->type == LLAMA_GRETYPE_CHAR_ANY) {
+            // Any character matches "."
+            return true;
         } else {
             // exact char match, e.g. [a] or "a"
             if (low <= pos->value && pos->value <= high) {
@@ -11148,7 +13724,9 @@ static void llama_grammar_advance_stack(
         std::vector<std::vector<const llama_grammar_element *>> & new_stacks) {
 
     if (stack.empty()) {
-        new_stacks.emplace_back(stack);
+        if (std::find(new_stacks.begin(), new_stacks.end(), stack) == new_stacks.end()) {
+            new_stacks.emplace_back(stack);
+        }
         return;
     }
 
@@ -11185,7 +13763,11 @@ static void llama_grammar_advance_stack(
         }
         case LLAMA_GRETYPE_CHAR:
         case LLAMA_GRETYPE_CHAR_NOT:
-            new_stacks.emplace_back(stack);
+        case LLAMA_GRETYPE_CHAR_ANY:
+            if (std::find(new_stacks.begin(), new_stacks.end(), stack) == new_stacks.end()) {
+                // only add the stack if it's not a duplicate of one we already have
+                new_stacks.emplace_back(stack);
+            }
             break;
         default:
             // end of alternate (LLAMA_GRETYPE_END, LLAMA_GRETYPE_ALT) or middle of char range
@@ -11199,12 +13781,13 @@ static void llama_grammar_advance_stack(
 // be positioned at a character range (see `llama_grammar_advance_stack`), and
 // produces the N possible stacks if the given char is accepted at those
 // positions
-static std::vector<std::vector<const llama_grammar_element *>> llama_grammar_accept(
+void llama_grammar_accept(
         const std::vector<std::vector<llama_grammar_element>>         & rules,
         const std::vector<std::vector<const llama_grammar_element *>> & stacks,
-        const uint32_t                                                  chr) {
+        const uint32_t                                                  chr,
+        std::vector<std::vector<const llama_grammar_element *>>       & new_stacks) {
 
-    std::vector<std::vector<const llama_grammar_element *>> new_stacks;
+    new_stacks.clear();
 
     for (const auto & stack : stacks) {
         if (stack.empty()) {
@@ -11223,8 +13806,6 @@ static std::vector<std::vector<const llama_grammar_element *>> llama_grammar_acc
             llama_grammar_advance_stack(rules, new_stack, new_stacks);
         }
     }
-
-    return new_stacks;
 }
 
 static std::vector<llama_grammar_candidate> llama_grammar_reject_candidates(
@@ -11238,6 +13819,7 @@ static std::vector<llama_grammar_candidate> llama_grammar_reject_candidates_for_
         const std::vector<llama_grammar_candidate>            & candidates) {
 
     std::vector<llama_grammar_candidate> rejects;
+    rejects.reserve(candidates.size());
 
     if (stack.empty()) {
         for (const auto & tok : candidates) {
@@ -11251,6 +13833,8 @@ static std::vector<llama_grammar_candidate> llama_grammar_reject_candidates_for_
     const llama_grammar_element * stack_pos = stack.back();
 
     std::vector<llama_grammar_candidate> next_candidates;
+    next_candidates.reserve(candidates.size());
+
     for (const auto & tok : candidates) {
         if (*tok.code_points == 0) {
             // reached end of full codepoints in token, reject iff it ended in a partial sequence
@@ -11302,6 +13886,58 @@ static std::vector<llama_grammar_candidate> llama_grammar_reject_candidates(
     return rejects;
 }
 
+static bool llama_grammar_detect_left_recursion(
+        const std::vector<std::vector<llama_grammar_element>> & rules,
+        size_t                                                  rule_index,
+        std::vector<bool>                                     * rules_visited,
+        std::vector<bool>                                     * rules_in_progress,
+        std::vector<bool>                                     * rules_may_be_empty) {
+    if ((*rules_in_progress)[rule_index]) {
+        return true;
+    }
+
+    (*rules_in_progress)[rule_index] = true;
+
+    const std::vector<llama_grammar_element> & rule = rules[rule_index];
+
+    // First check if the rule might produce the empty string. This could be done combined with the second
+    // step but it's more readable as two steps.
+    bool at_rule_start = true;
+    for (size_t i = 0; i < rule.size(); i++) {
+        if (llama_grammar_is_end_of_sequence(&rule[i])) {
+            if (at_rule_start) {
+                (*rules_may_be_empty)[rule_index] = true;
+                break;
+            }
+            at_rule_start = true;
+        } else {
+            at_rule_start = false;
+        }
+    }
+
+    // Second, recurse into leftmost nonterminals (or next-leftmost as long as the previous nonterminal may
+    // be empty)
+    bool recurse_into_nonterminal = true;
+    for (size_t i = 0; i < rule.size(); i++) {
+        if (rule[i].type == LLAMA_GRETYPE_RULE_REF && recurse_into_nonterminal) {
+            if (llama_grammar_detect_left_recursion(rules, (size_t)rule[i].value, rules_visited, rules_in_progress, rules_may_be_empty)) {
+                return true;
+            }
+            if (!((*rules_may_be_empty)[(size_t)rule[i].value])) {
+                recurse_into_nonterminal = false;
+            }
+        } else if (llama_grammar_is_end_of_sequence(&rule[i])) {
+            recurse_into_nonterminal = true;
+        } else {
+            recurse_into_nonterminal = false;
+        }
+    }
+
+    (*rules_in_progress)[rule_index] = false;
+    (*rules_visited)[rule_index] = true;
+    return false;
+}
+
 //
 // grammar - external
 //
@@ -11319,6 +13955,19 @@ struct llama_grammar * llama_grammar_init(
             vec_rules[i].push_back(*pos);
         }
         vec_rules[i].push_back({LLAMA_GRETYPE_END, 0});
+    }
+
+    // Check for left recursion
+    std::vector<bool> rules_visited(n_rules);
+    std::vector<bool> rules_in_progress(n_rules);
+    std::vector<bool> rules_may_be_empty(n_rules);
+    for (size_t i = 0; i < n_rules; i++) {
+        if (rules_visited[i]) {
+            continue;
+        }
+        if (llama_grammar_detect_left_recursion(vec_rules, i, &rules_visited, &rules_in_progress, &rules_may_be_empty)) {
+            throw std::runtime_error(format("unsupported grammar, left recursion detected for nonterminal at index %zu", i));
+        }
     }
 
     // loop over alternates of start rule to build initial stacks
@@ -11343,6 +13992,9 @@ struct llama_grammar * llama_grammar_init(
         }
     } while (true);
 
+    // Important: vec_rules has to be moved here, not copied, because stacks contains
+    // pointers to elements of vec_rules. If vec_rules were copied into llama_grammar
+    // then the pointers would be invalidated when the local vec_rules goes out of scope.
     return new llama_grammar{ std::move(vec_rules), std::move(stacks), {} };
 }
 
@@ -11834,28 +14486,28 @@ void llama_sample_repetition_penalties(
 
 void llama_sample_grammar(struct llama_context * ctx, llama_token_data_array * candidates, const struct llama_grammar * grammar) {
     GGML_ASSERT(ctx);
-    const int64_t t_start_sample_us = ggml_time_us();
+    int64_t t_start_sample_us = ggml_time_us();
 
-    bool allow_eos = false;
+    bool allow_eog = false;
     for (const auto & stack : grammar->stacks) {
         if (stack.empty()) {
-            allow_eos = true;
+            allow_eog = true;
             break;
         }
     }
 
-    const llama_token eos = llama_token_eos(&ctx->model);
-
     std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
     candidates_decoded.reserve(candidates->size);
-    std::vector<llama_grammar_candidate>                              candidates_grammar;
+
+    std::vector<llama_grammar_candidate> candidates_grammar;
     candidates_grammar.reserve(candidates->size);
 
     for (size_t i = 0; i < candidates->size; ++i) {
-        const llama_token id    = candidates->data[i].id;
-        const std::string piece = llama_token_to_piece(ctx, id);
-        if (id == eos) {
-            if (!allow_eos) {
+        const llama_token id      = candidates->data[i].id;
+        const std::string & piece = ctx->model.vocab.cache_token_to_piece.at(id);
+
+        if (llama_token_is_eog(&ctx->model, id)) {
+            if (!allow_eog) {
                 candidates->data[i].logit = -INFINITY;
             }
         } else if (piece.empty() || piece[0] == 0) {
@@ -11938,9 +14590,7 @@ llama_token llama_sample_token_mirostat(struct llama_context * ctx, llama_token_
 
     // Sample the next word X using top-k sampling
     llama_sample_top_k(nullptr, candidates, int(k), 1);
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
     llama_token X = llama_sample_token(ctx, candidates);
     t_start_sample_us = ggml_time_us();
 
@@ -11954,9 +14604,7 @@ llama_token llama_sample_token_mirostat(struct llama_context * ctx, llama_token_
     // Update mu using the learning rate and error
     *mu = *mu - eta * e;
 
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
     return X;
 }
 
@@ -12018,7 +14666,7 @@ llama_token llama_sample_token_greedy(struct llama_context * ctx, llama_token_da
     return result;
 }
 
-llama_token llama_sample_token(struct llama_context * ctx, llama_token_data_array * candidates) {
+llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_data_array * candidates, std::mt19937 & rng) {
     GGML_ASSERT(ctx);
 
     const int64_t t_start_sample_us = ggml_time_us();
@@ -12031,7 +14679,6 @@ llama_token llama_sample_token(struct llama_context * ctx, llama_token_data_arra
     }
 
     std::discrete_distribution<> dist(probs.begin(), probs.end());
-    auto & rng = ctx->rng;
     int idx = dist(rng);
 
     llama_token result = candidates->data[idx].id;
@@ -12041,10 +14688,14 @@ llama_token llama_sample_token(struct llama_context * ctx, llama_token_data_arra
     return result;
 }
 
+llama_token llama_sample_token(struct llama_context * ctx, llama_token_data_array * candidates) {
+    return llama_sample_token_with_rng(ctx, candidates, ctx->rng);
+}
+
 void llama_grammar_accept_token(struct llama_context * ctx, struct llama_grammar * grammar, llama_token token) {
     const int64_t t_start_sample_us = ggml_time_us();
 
-    if (token == llama_token_eos(&ctx->model)) {
+    if (llama_token_is_eog(&ctx->model, token)) {
         for (const auto & stack : grammar->stacks) {
             if (stack.empty()) {
                 return;
@@ -12053,267 +14704,20 @@ void llama_grammar_accept_token(struct llama_context * ctx, struct llama_grammar
         GGML_ASSERT(false);
     }
 
-    const std::string piece = llama_token_to_piece(ctx, token);
+    const std::string & piece = ctx->model.vocab.cache_token_to_piece.at(token);
 
     // Note terminating 0 in decoded string
     const auto   decoded     = decode_utf8(piece, grammar->partial_utf8);
     const auto & code_points = decoded.first;
+    std::vector<std::vector<const llama_grammar_element *>> tmp_new_stacks;
     for (auto it = code_points.begin(), end = code_points.end() - 1; it != end; ++it) {
-        grammar->stacks = llama_grammar_accept(grammar->rules, grammar->stacks, *it);
+        llama_grammar_accept(grammar->rules, grammar->stacks, *it, tmp_new_stacks);
+        grammar->stacks = tmp_new_stacks;
     }
     grammar->partial_utf8 = decoded.second;
     GGML_ASSERT(!grammar->stacks.empty());
 
     ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-}
-
-//
-// Beam search
-//
-
-struct llama_beam {
-    std::vector<llama_token> tokens;
-    float p;  // Cumulative beam probability (renormalized relative to all beams)
-    bool eob; // Initialize end-of-beam to false. Callback sets this to true.
-    // Sort beams by probability. In case of ties, prefer beams at eob.
-    bool operator<(const llama_beam & rhs) const {
-        return std::make_pair(p, eob) < std::make_pair(rhs.p, rhs.eob);
-    }
-    // Shift off first n tokens and discard them.
-    void shift_tokens(const size_t n) {
-        if (n) {
-            std::copy(tokens.begin() + n, tokens.end(), tokens.begin());
-            tokens.resize(tokens.size() - n);
-        }
-    }
-    llama_beam_view view() const { return {tokens.data(), tokens.size(), p, eob}; }
-};
-
-// A struct for calculating logit-related info.
-struct llama_logit_info {
-    const float * const logits;
-    const int n_vocab;
-    const float max_l;
-    const float normalizer;
-    struct sum_exp {
-        float max_l;
-        float operator()(float sum, float l) const { return sum + std::exp(l - max_l); }
-    };
-    llama_logit_info(llama_context * ctx)
-      : logits(llama_get_logits(ctx))
-      , n_vocab(llama_n_vocab(llama_get_model(ctx)))
-      , max_l(*std::max_element(logits, logits + n_vocab))
-      , normalizer(1.0f / std::accumulate(logits, logits + n_vocab, 0.0f, sum_exp{max_l}))
-      { }
-    llama_token_data get_token_data(const llama_token token_id) const {
-        constexpr auto p = std::numeric_limits<float>::quiet_NaN();  // never used
-        return {token_id, logits[token_id], p};
-    }
-    // Return top k token_data by logit.
-    std::vector<llama_token_data> top_k(size_t k) {
-        std::vector<llama_token_data> min_heap;  // min-heap by logit
-        const llama_token k_min = std::min(static_cast<llama_token>(k), n_vocab);
-        min_heap.reserve(k_min);
-        for (llama_token token_id = 0 ; token_id < k_min ; ++token_id) {
-            min_heap.push_back(get_token_data(token_id));
-        }
-        auto comp = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
-        std::make_heap(min_heap.begin(), min_heap.end(), comp);
-        for (llama_token token_id = k_min ; token_id < n_vocab ; ++token_id) {
-            if (min_heap.front().logit < logits[token_id]) {
-                std::pop_heap(min_heap.begin(), min_heap.end(), comp);
-                min_heap.back().id = token_id;
-                min_heap.back().logit = logits[token_id];
-                std::push_heap(min_heap.begin(), min_heap.end(), comp);
-            }
-        }
-        return min_heap;
-    }
-    float probability_from_logit(float logit) const {
-        return normalizer * std::exp(logit - max_l);
-    }
-};
-
-struct llama_beam_search_data {
-    llama_context * ctx;
-    size_t n_beams;
-    int n_past;
-    int n_predict;
-    std::vector<llama_beam> beams;
-    std::vector<llama_beam> next_beams;
-
-    // Re-calculated on each loop iteration
-    size_t common_prefix_length;
-
-    // Used to communicate to/from callback on beams state.
-    std::vector<llama_beam_view> beam_views;
-
-    llama_beam_search_data(llama_context * ctx, size_t n_beams, int n_past, int n_predict)
-      : ctx(ctx)
-      , n_beams(n_beams)
-      , n_past(n_past)
-      , n_predict(n_predict)
-      , beam_views(n_beams) {
-        beams.reserve(n_beams);
-        next_beams.reserve(n_beams);
-    }
-
-    // Collapse beams to a single beam given by index.
-    void collapse_beams(const size_t beam_idx) {
-        if (0u < beam_idx) {
-            std::swap(beams[0], beams[beam_idx]);
-        }
-        beams.resize(1);
-    }
-
-    // Min-heaps are used to efficiently collect the top-k elements (k=n_beams).
-    // The repetitive patterns below reflect the 2 stages of heaps:
-    //  * Gather elements until the vector is full, then call std::make_heap() on it.
-    //  * If the heap is full and a new element is found that should be included, pop the
-    //    least element to the back(), replace it with the new, then push it into the heap.
-    void fill_next_beams_by_top_probabilities(llama_beam & beam) {
-        // Min-heaps use a greater-than comparator.
-        const auto comp = [](const llama_beam & a, const llama_beam & b) { return a.p > b.p; };
-        if (beam.eob) {
-            // beam is at end-of-sentence, so just copy it to next_beams if its probability is high enough.
-            if (next_beams.size() < n_beams) {
-                next_beams.push_back(std::move(beam));
-                if (next_beams.size() == n_beams) {
-                    std::make_heap(next_beams.begin(), next_beams.end(), comp);
-                }
-            } else if (next_beams.front().p < beam.p) {
-                std::pop_heap(next_beams.begin(), next_beams.end(), comp);
-                next_beams.back() = std::move(beam);
-                std::push_heap(next_beams.begin(), next_beams.end(), comp);
-            }
-        } else {
-            // beam is not at end-of-sentence, so branch with next top_k tokens.
-            if (!beam.tokens.empty()) {
-                llama_decode(ctx, llama_batch_get_one(beam.tokens.data(), beam.tokens.size(), n_past, 0));
-            }
-            llama_logit_info logit_info(ctx);
-            std::vector<llama_token_data> next_tokens = logit_info.top_k(n_beams);
-            size_t i=0;
-            if (next_beams.size() < n_beams) {
-                for (; next_beams.size() < n_beams ; ++i) {
-                    llama_beam next_beam = beam;
-                    next_beam.tokens.push_back(next_tokens[i].id);
-                    next_beam.p *= logit_info.probability_from_logit(next_tokens[i].logit);
-                    next_beams.push_back(std::move(next_beam));
-                }
-                std::make_heap(next_beams.begin(), next_beams.end(), comp);
-            } else {
-                for (; next_beams.front().p == 0.0f ; ++i) {
-                    std::pop_heap(next_beams.begin(), next_beams.end(), comp);
-                    next_beams.back() = beam;
-                    next_beams.back().tokens.push_back(next_tokens[i].id);
-                    next_beams.back().p *= logit_info.probability_from_logit(next_tokens[i].logit);
-                    std::push_heap(next_beams.begin(), next_beams.end(), comp);
-                }
-            }
-            for (; i < n_beams ; ++i) {
-                const float next_p = beam.p * logit_info.probability_from_logit(next_tokens[i].logit);
-                if (next_beams.front().p < next_p) {
-                    std::pop_heap(next_beams.begin(), next_beams.end(), comp);
-                    next_beams.back() = beam;
-                    next_beams.back().tokens.push_back(next_tokens[i].id);
-                    next_beams.back().p = next_p;
-                    std::push_heap(next_beams.begin(), next_beams.end(), comp);
-                }
-            }
-        }
-    }
-
-    // Find common_prefix_length based on beams.
-    // Requires beams is not empty.
-    size_t find_common_prefix_length() {
-        size_t common_prefix_length = beams[0].tokens.size();
-        for (size_t i = 1 ; i < beams.size() ; ++i) {
-            common_prefix_length = std::min(common_prefix_length, beams[i].tokens.size());
-            for (size_t j = 0 ; j < common_prefix_length ; ++j) {
-                if (beams[0].tokens[j] != beams[i].tokens[j]) {
-                    common_prefix_length = j;
-                    break;
-                }
-            }
-        }
-        return common_prefix_length;
-    }
-
-    // Construct beams_state to send back to caller via the callback function.
-    // Side effect: set common_prefix_length = find_common_prefix_length();
-    llama_beams_state get_beams_state(const bool last_call) {
-        for (size_t i = 0 ; i < beams.size() ; ++i) {
-            beam_views[i] = beams[i].view();
-        }
-        common_prefix_length = find_common_prefix_length();
-        return {beam_views.data(), beams.size(), common_prefix_length, last_call};
-    }
-
-    // Loop:
-    //  * while i < n_predict, AND
-    //  * any of the beams have not yet reached end-of-beam (eob), AND
-    //  * the highest probability beam(s) (plural in case of ties) are not at end-of-sentence
-    //    (since all other beam probabilities can only decrease)
-    void loop(const llama_beam_search_callback_fn_t callback, void * const callback_data) {
-        beams.push_back({{}, 1.0f, false});  // Start with one empty beam w/ probability = 1.0 and !eob.
-        const auto not_eob = [](const llama_beam & beam) { return !beam.eob; };
-        for (int i = 0 ; i < n_predict && std::any_of(beams.begin(),beams.end(),not_eob) &&
-                       !beams[top_beam_index()].eob ; ++i) {
-            callback(callback_data, get_beams_state(false));  // Sets common_prefix_length
-            update_beams_from_beam_views();   // Update values (p,eob) that callback may have changed.
-            if (common_prefix_length) {
-                llama_decode(ctx, llama_batch_get_one(beams[0].tokens.data(), common_prefix_length, n_past, 0));
-                n_past += common_prefix_length;
-            }
-            // Zero-out next_beam probabilities to place them last in following min-heap.
-            std::for_each(next_beams.begin(), next_beams.end(), [](llama_beam & beam) { beam.p = 0.0f; });
-            for (llama_beam & beam : beams) {
-                beam.shift_tokens(common_prefix_length);
-                fill_next_beams_by_top_probabilities(beam);
-            }
-            // next_beams become the beams of next/final iteration. Swap them to re-use memory.
-            beams.swap(next_beams);
-            renormalize_beam_probabilities(beams);
-        }
-        collapse_beams(top_beam_index());
-        callback(callback_data, get_beams_state(true));
-    }
-
-    // As beams grow, the cumulative probabilities decrease.
-    // Renormalize them to avoid floating point underflow.
-    static void renormalize_beam_probabilities(std::vector<llama_beam> & beams) {
-        const auto sum_p = [](float sum, llama_beam & beam) { return sum + beam.p; };
-        const float inv_sum = 1.0f / std::accumulate(beams.begin(), beams.end(), 0.0f, sum_p);
-        std::for_each(beams.begin(), beams.end(), [=](llama_beam & beam) { beam.p *= inv_sum; });
-    }
-
-    // Assumes beams is non-empty.  Uses llama_beam::operator<() for ordering.
-    size_t top_beam_index() {
-        return std::max_element(beams.begin(), beams.end()) - beams.begin();
-    }
-
-    // Copy (p,eob) for each beam which may have been changed by the callback.
-    void update_beams_from_beam_views() {
-        for (size_t i = 0 ; i < beams.size() ; ++i) {
-            beams[i].p = beam_views[i].p;
-            beams[i].eob = beam_views[i].eob;
-        }
-    }
-};
-
-void llama_beam_search(llama_context * ctx,
-                       llama_beam_search_callback_fn_t callback, void * callback_data,
-                       size_t n_beams, int n_past, int n_predict) {
-    assert(ctx);
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    llama_beam_search_data beam_search_data(ctx, n_beams, n_past, n_predict);
-
-    beam_search_data.loop(callback, callback_data);
-
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    ctx->n_sample++;
 }
 
 //
@@ -12362,13 +14766,16 @@ static void llama_tensor_dequantize_internal(
         if (qtype.to_float == NULL) {
             throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(tensor->type)));
         }
-    } else if (tensor->type != GGML_TYPE_F16) {
+    } else if (tensor->type != GGML_TYPE_F16 &&
+               tensor->type != GGML_TYPE_BF16) {
         throw std::runtime_error(format("cannot dequantize/convert tensor type %s", ggml_type_name(tensor->type)));
     }
 
     if (nthread < 2) {
         if (tensor->type == GGML_TYPE_F16) {
             ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor->data, f32_output, nelements);
+        } else if (tensor->type == GGML_TYPE_BF16) {
+            ggml_bf16_to_fp32_row((ggml_bf16_t *)tensor->data, f32_output, nelements);
         } else if (ggml_is_quantized(tensor->type)) {
             qtype.to_float(tensor->data, f32_output, nelements);
         } else {
@@ -12377,7 +14784,14 @@ static void llama_tensor_dequantize_internal(
         return;
     }
 
-    size_t block_size = tensor->type == GGML_TYPE_F16 ? 1 : (size_t)ggml_blck_size(tensor->type);
+    size_t block_size;
+    if (tensor->type == GGML_TYPE_F16 ||
+        tensor->type == GGML_TYPE_BF16) {
+        block_size = 1;
+    } else {
+        block_size = (size_t)ggml_blck_size(tensor->type);
+    }
+
     size_t block_size_bytes = ggml_type_size(tensor->type);
 
     GGML_ASSERT(nelements % block_size == 0);
@@ -12396,6 +14810,8 @@ static void llama_tensor_dequantize_internal(
         auto compute = [qtype] (ggml_type typ, uint8_t * inbuf, float * outbuf, int nels) {
             if (typ == GGML_TYPE_F16) {
                 ggml_fp16_to_fp32_row((ggml_fp16_t *)inbuf, outbuf, nels);
+            } else if (typ == GGML_TYPE_BF16) {
+                ggml_bf16_to_fp32_row((ggml_bf16_t *)inbuf, outbuf, nels);
             } else {
                 qtype.to_float(inbuf, outbuf, nels);
             }
@@ -12425,7 +14841,6 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
             // sprinkled in the model. Hence, simply dividing i_ffn_down by n_expert does not work
             // for getting the current layer as I initially thought, and we need to resort to parsing the
             // tensor name.
-            n_layer /= n_expert;
             if (sscanf(name, "blk.%d.", &i_layer) != 1) {
                 throw std::runtime_error(format("Failed to determine layer for tensor %s", name));
             }
@@ -12447,7 +14862,8 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
                 new_type = GGML_TYPE_Q8_0;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
-                    ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_S  || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) {
+                     ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_S  || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M   ||
+                     ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
             else if (new_type != GGML_TYPE_Q8_0) {
@@ -12458,7 +14874,8 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
         if (qs.params->token_embedding_type < GGML_TYPE_COUNT) {
             new_type = qs.params->token_embedding_type;
         } else {
-            if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S) {
+            if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS ||
+                ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q2_K;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) {
@@ -12469,7 +14886,7 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
             }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
-               ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) {
+               ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M    || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
         if (name.find("attn_v.weight") != std::string::npos) {
             if (qs.model.hparams.n_gqa() >= 4 || qs.model.hparams.n_expert >= 4) new_type = GGML_TYPE_Q4_K;
             else new_type = ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M ? GGML_TYPE_IQ3_S : GGML_TYPE_Q2_K;
@@ -12488,7 +14905,7 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
             if (qs.model.hparams.n_expert == 8) {
                 new_type = GGML_TYPE_Q5_K;
             } else {
-                if (ftype == LLAMA_FTYPE_MOSTLY_IQ1_S) new_type = GGML_TYPE_IQ2_XXS;
+                if (ftype == LLAMA_FTYPE_MOSTLY_IQ1_S || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) new_type = GGML_TYPE_IQ2_XXS;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) new_type = GGML_TYPE_IQ3_S;
             }
         }
@@ -12518,8 +14935,6 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
         else if ((ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) &&
                 use_more_bits(qs.i_attention_wv, qs.n_attention_wv)) new_type = GGML_TYPE_Q6_K;
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S && qs.i_attention_wv < 4) new_type = GGML_TYPE_Q5_K;
-        else if (QK_K == 64 && (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_S) &&
-                (qs.i_attention_wv < qs.n_attention_wv/8 || qs.i_attention_wv >= 7*qs.n_attention_wv/8)) new_type = GGML_TYPE_Q6_K;
         if (qs.model.type == MODEL_70B) {
             // In the 70B model we have 8 heads sharing the same attn_v weights. As a result, the attn_v.weight tensor is
             // 8x smaller compared to attn_q.weight. Hence, we can get a nice boost in quantization accuracy with
@@ -12655,7 +15070,8 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
     if (new_type == GGML_TYPE_Q2_K || new_type == GGML_TYPE_Q3_K || new_type == GGML_TYPE_Q4_K ||
         new_type == GGML_TYPE_Q5_K || new_type == GGML_TYPE_Q6_K || new_type == GGML_TYPE_IQ4_XS ||
         new_type == GGML_TYPE_IQ2_XS || new_type == GGML_TYPE_IQ2_XXS || new_type == GGML_TYPE_IQ2_S ||
-        new_type == GGML_TYPE_IQ3_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S || new_type == GGML_TYPE_IQ3_S) {
+        new_type == GGML_TYPE_IQ3_XXS || new_type == GGML_TYPE_IQ1_S || new_type == GGML_TYPE_IQ3_S ||
+        new_type == GGML_TYPE_IQ1_M) {
         int nx = tensor->ne[0];
         int ny = tensor->ne[1];
         if (nx % QK_K != 0) {
@@ -12673,6 +15089,7 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_S:
             case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ1_M:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_IQ4_XS: new_type = GGML_TYPE_IQ4_NL; break;
@@ -12688,21 +15105,27 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
     return new_type;
 }
 
-static size_t llama_tensor_quantize_internal(enum ggml_type new_type, const float * f32_data, void * new_data, const int chunk_size, int nrows, int n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
-    std::mutex mutex;
-    int counter = 0;
-    size_t new_size = 0;
+static size_t llama_tensor_quantize_internal(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t nrows, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
     if (nthread < 2) {
         // single-thread
-        return ggml_quantize_chunk(new_type, f32_data, new_data, 0, nrows, n_per_row, imatrix);
+        size_t new_size = ggml_quantize_chunk(new_type, f32_data, new_data, 0, nrows, n_per_row, imatrix);
+        if (!ggml_validate_row_data(new_type, new_data, new_size)) {
+            throw std::runtime_error("quantized data validation failed");
+        }
+        return new_size;
     }
-    auto compute = [&mutex, &counter, &new_size, new_type, f32_data, new_data, chunk_size,
+
+    std::mutex mutex;
+    int64_t counter = 0;
+    size_t new_size = 0;
+    bool valid = true;
+    auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
             nrows, n_per_row, imatrix]() {
-        const int nrows_per_chunk = chunk_size / n_per_row;
+        const int64_t nrows_per_chunk = chunk_size / n_per_row;
         size_t local_size = 0;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
-            int first_row = counter; counter += nrows_per_chunk;
+            int64_t first_row = counter; counter += nrows_per_chunk;
             if (first_row >= nrows) {
                 if (local_size > 0) {
                     new_size += local_size;
@@ -12710,8 +15133,18 @@ static size_t llama_tensor_quantize_internal(enum ggml_type new_type, const floa
                 break;
             }
             lock.unlock();
-            const int this_nrow = std::min(nrows - first_row, nrows_per_chunk);
-            local_size += ggml_quantize_chunk(new_type, f32_data, new_data, first_row * n_per_row, this_nrow, n_per_row, imatrix);
+            const int64_t this_nrow = std::min(nrows - first_row, nrows_per_chunk);
+            size_t this_size = ggml_quantize_chunk(new_type, f32_data, new_data, first_row * n_per_row, this_nrow, n_per_row, imatrix);
+            local_size += this_size;
+
+            // validate the quantized data
+            const size_t row_size  = ggml_row_size(new_type, n_per_row);
+            void * this_data = (char *) new_data + first_row * row_size;
+            if (!ggml_validate_row_data(new_type, this_data, this_size)) {
+                std::unique_lock<std::mutex> lock(mutex);
+                valid = false;
+                break;
+            }
         }
     };
     for (int it = 0; it < nthread - 1; ++it) {
@@ -12720,6 +15153,9 @@ static size_t llama_tensor_quantize_internal(enum ggml_type new_type, const floa
     compute();
     for (auto & w : workers) { w.join(); }
     workers.clear();
+    if (!valid) {
+        throw std::runtime_error("quantized data validation failed");
+    }
     return new_size;
 }
 
@@ -12734,6 +15170,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_Q5_1: default_type = GGML_TYPE_Q5_1; break;
         case LLAMA_FTYPE_MOSTLY_Q8_0: default_type = GGML_TYPE_Q8_0; break;
         case LLAMA_FTYPE_MOSTLY_F16:  default_type = GGML_TYPE_F16;  break;
+        case LLAMA_FTYPE_MOSTLY_BF16: default_type = GGML_TYPE_BF16; break;
         case LLAMA_FTYPE_ALL_F32:     default_type = GGML_TYPE_F32;  break;
 
         // K-quants
@@ -12754,6 +15191,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_IQ2_M:   default_type = GGML_TYPE_IQ2_S;   break;
         case LLAMA_FTYPE_MOSTLY_IQ3_XXS: default_type = GGML_TYPE_IQ3_XXS; break;
         case LLAMA_FTYPE_MOSTLY_IQ1_S:   default_type = GGML_TYPE_IQ1_S;   break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_M:   default_type = GGML_TYPE_IQ1_M;   break;
         case LLAMA_FTYPE_MOSTLY_IQ4_NL:  default_type = GGML_TYPE_IQ4_NL;  break;
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  default_type = GGML_TYPE_IQ4_XS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:   default_type = GGML_TYPE_IQ3_S;   break;
@@ -12776,8 +15214,13 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     constexpr bool use_mmap = false;
 #endif
 
-    llama_model_loader ml(fname_inp, use_mmap, NULL);
-    ml.init_mappings(false); // no prefetching?
+    llama_model_kv_override * kv_overrides = nullptr;
+    if (params->kv_overrides) {
+        auto v = (std::vector<llama_model_kv_override>*)params->kv_overrides;
+        kv_overrides = v->data();
+    }
+    llama_model_loader ml(fname_inp, use_mmap, /*check_tensors*/ true, kv_overrides);
+    ml.init_mappings(false); // no prefetching
 
     llama_model model;
     llm_load_arch(ml, model);
@@ -12794,6 +15237,14 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         if (imatrix_data) {
             LLAMA_LOG_INFO("================================ Have weights data with %d entries\n",int(imatrix_data->size()));
             qs.has_imatrix = true;
+            // check imatrix for nans or infs
+            for (const auto & kv : *imatrix_data) {
+                for (float f : kv.second) {
+                    if (!std::isfinite(f)) {
+                        throw std::runtime_error(format("imatrix contains non-finite value %f\n", f));
+                    }
+                }
+            }
         }
     }
 
@@ -12804,6 +15255,28 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     gguf_set_kv     (ctx_out, ml.meta);
     gguf_set_val_u32(ctx_out, "general.quantization_version", GGML_QNT_VERSION);
     gguf_set_val_u32(ctx_out, "general.file_type", ftype);
+    // Remove split metadata
+    gguf_remove_key(ctx_out, ml.llm_kv(LLM_KV_SPLIT_NO).c_str());
+    gguf_remove_key(ctx_out, ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str());
+    gguf_remove_key(ctx_out, ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str());
+
+    if (params->kv_overrides) {
+        const std::vector<llama_model_kv_override> & overrides = *(const std::vector<llama_model_kv_override> *)params->kv_overrides;
+        for (auto & o : overrides) {
+            if (o.key[0] == 0) break;
+            if (o.tag == LLAMA_KV_OVERRIDE_TYPE_FLOAT) {
+                gguf_set_val_f32(ctx_out, o.key, o.val_f64);
+            } else if (o.tag == LLAMA_KV_OVERRIDE_TYPE_INT) {
+                gguf_set_val_i32(ctx_out, o.key, o.val_i64);
+            } else if (o.tag == LLAMA_KV_OVERRIDE_TYPE_BOOL) {
+                gguf_set_val_bool(ctx_out, o.key, o.val_bool);
+            } else if (o.tag == LLAMA_KV_OVERRIDE_TYPE_STR) {
+                gguf_set_val_str(ctx_out, o.key, o.val_str);
+            } else {
+                LLAMA_LOG_WARN("%s: unknown KV override type for key %s\n", __func__, o.key);
+            }
+        }
+    }
 
     for (int i = 0; i < ml.n_tensors; ++i) {
         const struct ggml_tensor * meta = ml.get_tensor_meta(i);
@@ -12811,26 +15284,22 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         const std::string name = ggml_get_name(meta);
 
         // TODO: avoid hardcoded tensor names - use the TN_* constants
-        if (name.find("attn_v.weight") != std::string::npos || name.find("attn_qkv.weight") != std::string::npos) {
+        if (name.find("attn_v.weight")   != std::string::npos ||
+            name.find("attn_qkv.weight") != std::string::npos) {
             ++qs.n_attention_wv;
-        }
-        else if (name.find("ffn_down") != std::string::npos) {
-            ++qs.n_ffn_down;
-        }
-        else if (name.find("ffn_gate") != std::string::npos) {
-            ++qs.n_ffn_gate;
-        }
-        else if (name.find("ffn_up") != std::string::npos) {
-            ++qs.n_ffn_up;
-        }
-        else if (name == LLM_TN(model.arch)(LLM_TENSOR_OUTPUT, "weight")) {
+        } else if (name == LLM_TN(model.arch)(LLM_TENSOR_OUTPUT, "weight")) {
             qs.has_output = true;
         }
     }
-    if (qs.n_attention_wv != qs.n_ffn_down || (uint32_t)qs.n_attention_wv != model.hparams.n_layer) {
-        LLAMA_LOG_WARN("%s ============ Strange model: n_attention_wv = %d, n_ffn_down = %d, hparams.n_layer = %d\n",
-                __func__, qs.n_attention_wv, qs.n_ffn_down, model.hparams.n_layer);
-    }
+
+    qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)model.hparams.n_layer;
+
+    // sanity checks
+    //
+    //  - qs.n_attention_wv == 0                     for Mamba       models
+    //  - qs.n_attention_wv == model.hparams.n_layer for Transformer models
+    //
+    GGML_ASSERT((qs.n_attention_wv == 0 || qs.n_attention_wv == (int)model.hparams.n_layer) && "n_attention_wv is unexpected");
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;
@@ -12844,24 +15313,74 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
 
+    uint16_t n_split = 1;
+    // Assume split index is continuous
+    if (params->keep_split) {
+        for (int i = 0; i < ml.n_tensors; ++i) {
+            n_split = std::max(uint16_t(ml.get_weight(i)->idx+1), n_split);
+        }
+    }
+    std::vector<gguf_context*> ctx_outs(n_split, NULL);
+    ctx_outs[0] = ctx_out;
+
     // populate the original tensors so we get an initial meta data
     for (int i = 0; i < ml.n_tensors; ++i) {
-        const struct ggml_tensor * meta = ml.get_tensor_meta(i);
-        gguf_add_tensor(ctx_out, meta);
+        auto weight = ml.get_weight(i);
+        uint16_t i_split = params->keep_split ? weight->idx : 0;
+        struct ggml_tensor * tensor = weight->tensor;
+        if (ctx_outs[i_split] == NULL) {
+            ctx_outs[i_split] = gguf_init_empty();
+        }
+        gguf_add_tensor(ctx_outs[i_split], tensor);
     }
 
-    std::ofstream fout(fname_out, std::ios::binary);
-    fout.exceptions(std::ofstream::failbit); // fail fast on write errors
+    // Set split info if needed
+    if (n_split > 1) {
+        for (size_t i = 0; i < ctx_outs.size(); ++i) {
+            gguf_set_val_u16(ctx_outs[i], ml.llm_kv(LLM_KV_SPLIT_NO).c_str(), i);
+            gguf_set_val_u16(ctx_outs[i], ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str(), n_split);
+            gguf_set_val_i32(ctx_outs[i], ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(), ml.n_tensors);
+        }
+    }
 
-    const size_t meta_size = gguf_get_meta_size(ctx_out);
+    int cur_split = -1;
+    std::ofstream fout;
+    auto close_ofstream = [&]() {
+        // Write metadata and close file handler
+        if (fout.is_open()) {
+            fout.seekp(0);
+            std::vector<uint8_t> data(gguf_get_meta_size(ctx_outs[cur_split]));
+            gguf_get_meta_data(ctx_outs[cur_split], data.data());
+            fout.write((const char *) data.data(), data.size());
+            fout.close();
+        }
+    };
+    auto new_ofstream = [&](int index) {
+        cur_split = index;
+        GGML_ASSERT(ctx_outs[cur_split] && "Find uninitialized gguf_context");
+        std::string fname = fname_out;
+        if (params->keep_split) {
+            char split_path[PATH_MAX] = {0};
+            llama_split_path(split_path, sizeof(split_path), fname_out.c_str(), cur_split, n_split);
+            fname = std::string(split_path);
+        }
 
-    LLAMA_LOG_INFO("%s: meta size = %zu bytes\n", __func__, meta_size);
+        fout = std::ofstream(fname, std::ios::binary);
+        fout.exceptions(std::ofstream::failbit); // fail fast on write errors
+        const size_t meta_size = gguf_get_meta_size(ctx_outs[cur_split]);
+        // placeholder for the meta data
+        ::zeros(fout, meta_size);
+    };
 
-    // placeholder for the meta data
-    ::zeros(fout, meta_size);
-
+    const auto tn = LLM_TN(model.arch);
+    new_ofstream(0);
     for (int i = 0; i < ml.n_tensors; ++i) {
-        struct ggml_tensor * tensor = ml.get_tensor_meta(i);
+        auto weight = ml.get_weight(i);
+        struct ggml_tensor * tensor = weight->tensor;
+        if (weight->idx != cur_split && params->keep_split) {
+            close_ofstream();
+            new_ofstream(weight->idx);
+        }
 
         const std::string name = ggml_get_name(tensor);
 
@@ -12882,8 +15401,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         // This used to be a regex, but <regex> has an extreme cost to compile times.
         bool quantize = name.rfind("weight") == name.size() - 6; // ends with 'weight'?
 
-        // quantize only 2D tensors
-        quantize &= (ggml_n_dims(tensor) == 2);
+        // quantize only 2D and 3D tensors (experts)
+        quantize &= (ggml_n_dims(tensor) >= 2);
+
+        // do not quantize norm tensors
+        quantize &= name.find("_norm.weight") == std::string::npos;
+
         quantize &= params->quantize_output_tensor || name != "output.weight";
         quantize &= !params->only_copy;
 
@@ -12912,6 +15435,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             if (!params->pure && ggml_is_quantized(default_type)) {
                 new_type = llama_tensor_get_type(qs, new_type, tensor, ftype);
             }
+            if (params->token_embedding_type < GGML_TYPE_COUNT && strcmp(tensor->name, "token_embd.weight") == 0) {
+                new_type = params->token_embedding_type;
+            }
+            if (params->output_tensor_type < GGML_TYPE_COUNT && strcmp(tensor->name, "output.weight") == 0) {
+                new_type = params->output_tensor_type;
+            }
 
             // If we've decided to quantize to the same type the tensor is already
             // in then there's nothing to do.
@@ -12924,7 +15453,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             new_size = ggml_nbytes(tensor);
             LLAMA_LOG_INFO("size = %8.3f MB\n", ggml_nbytes(tensor)/1024.0/1024.0);
         } else {
-            const size_t nelements = ggml_nelements(tensor);
+            const int64_t nelements = ggml_nelements(tensor);
 
             const float * imatrix = nullptr;
             if (imatrix_data) {
@@ -12932,11 +15461,20 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 if (it == imatrix_data->end()) {
                     LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
                 } else {
-                    if (it->second.size() == (size_t)tensor->ne[0]) {
+                    if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]) {
                         imatrix = it->second.data();
                     } else {
                         LLAMA_LOG_INFO("\n====== %s: imatrix size %d is different from tensor size %d for %s\n", __func__,
-                                int(it->second.size()), int(tensor->ne[0]), tensor->name);
+                                int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]), tensor->name);
+
+                        // this can happen when quantizing an old mixtral model with split tensors with a new incompatible imatrix
+                        // this is a significant error and it may be good idea to abort the process if this happens,
+                        // since many people will miss the error and not realize that most of the model is being quantized without an imatrix
+                        // tok_embd should be ignored in this case, since it always causes this warning
+                        if (name != tn(LLM_TENSOR_TOKEN_EMBD, "weight")) {
+                            throw std::runtime_error(format("imatrix size %d is different from tensor size %d for %s",
+                                    int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]), tensor->name));
+                        }
                     }
                 }
             }
@@ -12944,6 +15482,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                  new_type == GGML_TYPE_IQ2_XS  ||
                  new_type == GGML_TYPE_IQ2_S   ||
                  new_type == GGML_TYPE_IQ1_S   ||
+                (new_type == GGML_TYPE_IQ1_M && strcmp(tensor->name, "token_embd.weight") && strcmp(tensor->name, "output.weight"))  ||
                 (new_type == GGML_TYPE_Q2_K && params->ftype == LLAMA_FTYPE_MOSTLY_Q2_K_S && strcmp(tensor->name, "token_embd.weight") != 0)) && !imatrix) {
                 LLAMA_LOG_ERROR("\n\n============================================================\n");
                 LLAMA_LOG_ERROR("Missing importance matrix for tensor %s in a very low-bit quantization\n", tensor->name);
@@ -12966,46 +15505,47 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
             fflush(stdout);
 
-            if (work.size() < nelements * 4) {
+            if (work.size() < (size_t)nelements * 4) {
                 work.resize(nelements * 4); // upper bound on size
             }
             new_data = work.data();
 
-            const int n_per_row = tensor->ne[0];
-            const int nrows = nelements / n_per_row;
+            const int64_t n_per_row = tensor->ne[0];
+            const int64_t nrows = tensor->ne[1];
 
-            static const int min_chunk_size = 32 * 512;
-            const int chunk_size = n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row);
+            static const int64_t min_chunk_size = 32 * 512;
+            const int64_t chunk_size = n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row);
 
-            const int nchunk = (nelements + chunk_size - 1)/chunk_size;
-            const int nthread_use = nthread > 1 ? std::max(1, std::min(nthread, nchunk)) : 1;
-            new_size = llama_tensor_quantize_internal(new_type, f32_data, new_data, chunk_size, nrows, n_per_row, imatrix, workers, nthread_use);
+            const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
+            const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
+            const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
+            // quantize each expert separately since they have different importance matrices
+            new_size = 0;
+            for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                const float * f32_data_03 = f32_data + i03 * nelements_matrix;
+                void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
+                const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+
+                new_size += llama_tensor_quantize_internal(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+            }
             LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", ggml_nbytes(tensor)/1024.0/1024.0, new_size/1024.0/1024.0);
         }
         total_size_org += ggml_nbytes(tensor);
         total_size_new += new_size;
 
         // update the gguf meta data as we go
-        gguf_set_tensor_type(ctx_out, name.c_str(), new_type);
-        gguf_set_tensor_data(ctx_out, name.c_str(), new_data, new_size);
+        gguf_set_tensor_type(ctx_outs[cur_split], name.c_str(), new_type);
+        gguf_set_tensor_data(ctx_outs[cur_split], name.c_str(), new_data, new_size);
 
         // write tensor data + padding
         fout.write((const char *) new_data, new_size);
         zeros(fout, GGML_PAD(new_size, align) - new_size);
     }
-
-    // go back to beginning of file and write the updated meta data
-    {
-        fout.seekp(0);
-        std::vector<uint8_t> data(gguf_get_meta_size(ctx_out));
-        gguf_get_meta_data(ctx_out, data.data());
-        fout.write((const char *) data.data(), data.size());
+    close_ofstream();
+    for (auto & c:ctx_outs) {
+        gguf_free(c);
     }
-
-    fout.close();
-
-    gguf_free(ctx_out);
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);
@@ -13050,7 +15590,7 @@ static int llama_apply_lora_from_file_internal(
     std::unique_ptr<llama_model_loader> ml;
     if (path_base_model) {
         LLAMA_LOG_INFO("%s: loading base model from '%s'\n", __func__, path_base_model);
-        ml.reset(new llama_model_loader(path_base_model, /*use_mmap*/ true, /*kv_overrides*/ nullptr));
+        ml.reset(new llama_model_loader(path_base_model, /*use_mmap*/ true, /*check_tensors*/ false, /*kv_overrides*/ nullptr));
         ml->init_mappings(/*prefetch*/ false); // no prefetching
     }
 
@@ -13303,12 +15843,14 @@ struct llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.rpc_servers                 =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,
+        /*.check_tensors               =*/ false,
     };
 
 #ifdef GGML_USE_METAL
@@ -13345,6 +15887,7 @@ struct llama_context_params llama_context_default_params() {
         /*.logits_all                  =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
+        /*.flash_attn                  =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
     };
@@ -13362,16 +15905,20 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
         /*.quantize_output_tensor      =*/ true,
         /*.only_copy                   =*/ false,
         /*.pure                        =*/ false,
+        /*.keep_split                  =*/ false,
         /*.imatrix                     =*/ nullptr,
+        /*.kv_overrides                =*/ nullptr,
     };
 
     return result;
 }
 
 size_t llama_max_devices(void) {
-#if defined(GGML_USE_METAL)
+#if defined(GGML_USE_RPC)
+    return GGML_RPC_MAX_SERVERS;
+#elif defined(GGML_USE_METAL)
     return 1;
-#elif defined(GGML_USE_CUBLAS)
+#elif defined(GGML_USE_CUDA)
     return GGML_CUDA_MAX_DEVICES;
 #elif defined(GGML_USE_SYCL)
     return GGML_SYCL_MAX_DEVICES;
@@ -13391,8 +15938,8 @@ bool llama_supports_mlock(void) {
 }
 
 bool llama_supports_gpu_offload(void) {
-#if defined(GGML_USE_CUBLAS) || defined(GGML_USE_CLBLAST) || defined(GGML_USE_METAL) || defined(GGML_USE_VULKAN) || \
-    defined(GGML_USE_SYCL)   || defined(GGML_USE_KOMPUTE)
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_METAL)   || defined(GGML_USE_VULKAN) || \
+    defined(GGML_USE_SYCL) || defined(GGML_USE_KOMPUTE) || defined(GGML_USE_RPC)
     // Defined when llama.cpp is compiled with support for offloading model layers to GPU.
     return true;
 #else
@@ -13409,10 +15956,6 @@ void llama_backend_init(void) {
         struct ggml_context * ctx = ggml_init(params);
         ggml_free(ctx);
     }
-
-#ifdef GGML_USE_MPI
-    ggml_mpi_backend_init();
-#endif
 }
 
 void llama_numa_init(enum ggml_numa_strategy numa) {
@@ -13422,9 +15965,6 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
 }
 
 void llama_backend_free(void) {
-#ifdef GGML_USE_MPI
-    ggml_mpi_backend_free();
-#endif
     ggml_quantize_free();
 }
 
@@ -13455,7 +15995,17 @@ struct llama_model * llama_load_model_from_file(
             return true;
         };
     }
-
+    if (params.rpc_servers != nullptr && params.rpc_servers[0] != '\0') {
+        // split the servers set them into model->rpc_servers
+        std::string servers(params.rpc_servers);
+        size_t pos = 0;
+        while ((pos = servers.find(",")) != std::string::npos) {
+            std::string server = servers.substr(0, pos);
+            model->rpc_servers.push_back(server);
+            servers.erase(0, pos + 1);
+        }
+        model->rpc_servers.push_back(servers);
+    }
     int status = llama_model_load(path_model, *model, params);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
@@ -13494,12 +16044,22 @@ struct llama_context * llama_new_context_with_model(
         return nullptr;
     }
 
+    if (params.flash_attn && model->arch == LLM_ARCH_GROK) {
+        LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
+        params.flash_attn = false;
+    }
+
+    if (params.type_v != GGML_TYPE_F16 && !params.flash_attn) {
+        LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
+        return nullptr;
+    }
+
     llama_context * ctx = new llama_context(*model);
 
     const auto & hparams = model->hparams;
     auto       & cparams = ctx->cparams;
 
-    // TODO: maybe add n_seq_max here too
+    cparams.n_seq_max        = std::max(1u, params.n_seq_max);
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
     cparams.yarn_ext_factor  = params.yarn_ext_factor;
@@ -13509,6 +16069,7 @@ struct llama_context * llama_new_context_with_model(
     cparams.defrag_thold     = params.defrag_thold;
     cparams.embeddings       = params.embeddings;
     cparams.offload_kqv      = params.offload_kqv;
+    cparams.flash_attn       = params.flash_attn;
     cparams.pooling_type     = params.pooling_type;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
@@ -13516,15 +16077,23 @@ struct llama_context * llama_new_context_with_model(
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
     // this is necessary due to kv_self.n being padded later during inference
-    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 32);
+    cparams.n_ctx            = GGML_PAD(cparams.n_ctx, llama_kv_cache_get_padding(cparams));
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch          = hparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+
+    // the batch has to be at least GGML_KQ_MASK_PAD because we will be padding the KQ_mask
+    // this is required by GPU kernels in order to avoid out-of-bounds accesses (e.g. ggml_flash_attn_ext)
+    // ref: https://github.com/ggerganov/llama.cpp/pull/5021
+    if (cparams.n_batch < GGML_KQ_MASK_PAD) {
+        LLAMA_LOG_WARN("%s: n_batch is less than GGML_KQ_MASK_PAD - increasing to %d\n", __func__, GGML_KQ_MASK_PAD);
+        cparams.n_batch = GGML_KQ_MASK_PAD;
+    }
+
     cparams.n_ubatch         = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-
-    cparams.n_yarn_orig_ctx  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
-                               hparams.n_yarn_orig_ctx != 0 ? hparams.n_yarn_orig_ctx :
+    cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
+                               hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
                                                               hparams.n_ctx_train;
 
     cparams.cb_eval           = params.cb_eval;
@@ -13543,6 +16112,7 @@ struct llama_context * llama_new_context_with_model(
         cparams.yarn_ext_factor = rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN ? 1.0f : 0.0f;
     }
 
+    cparams.yarn_attn_factor *= hparams.rope_attn_factor;
     cparams.causal_attn = hparams.causal_attn;
 
     if (cparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
@@ -13560,6 +16130,7 @@ struct llama_context * llama_new_context_with_model(
     LLAMA_LOG_INFO("%s: n_ctx      = %u\n",     __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_batch    = %u\n",     __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch   = %u\n",     __func__, cparams.n_ubatch);
+    LLAMA_LOG_INFO("%s: flash_attn = %d\n",     __func__, cparams.flash_attn);
     LLAMA_LOG_INFO("%s: freq_base  = %.1f\n",   __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale = %g\n",     __func__, cparams.rope_freq_scale);
 
@@ -13587,7 +16158,7 @@ struct llama_context * llama_new_context_with_model(
 
     if (!hparams.vocab_only) {
         // initialize backends
-#ifdef GGML_USE_METAL
+#if defined(GGML_USE_METAL)
         if (model->n_gpu_layers > 0) {
             ctx->backend_metal = ggml_backend_metal_init();
             if (ctx->backend_metal == nullptr) {
@@ -13597,7 +16168,7 @@ struct llama_context * llama_new_context_with_model(
             }
             ctx->backends.push_back(ctx->backend_metal);
         }
-#elif defined(GGML_USE_CUBLAS)
+#elif defined(GGML_USE_CUDA)
         if (model->split_mode == LLAMA_SPLIT_MODE_NONE || model->split_mode == LLAMA_SPLIT_MODE_ROW) {
             // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_ROW, only the main GPU backend is used
             ggml_backend_t backend = ggml_backend_cuda_init(model->main_gpu);
@@ -13620,7 +16191,20 @@ struct llama_context * llama_new_context_with_model(
             }
         }
 #elif defined(GGML_USE_VULKAN)
-        if (model->n_gpu_layers > 0) {
+        if (model->split_mode == LLAMA_SPLIT_MODE_ROW) {
+            LLAMA_LOG_ERROR("%s: Row split not supported. Failed to initialize Vulkan backend\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+        if (model->split_mode == LLAMA_SPLIT_MODE_NONE) {
+            ggml_backend_t backend = ggml_backend_vk_init(model->main_gpu);
+            if (backend == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to initialize Vulkan backend\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
+            ctx->backends.push_back(backend);
+        } else {
             for (int device = 0; device < ggml_backend_vk_get_device_count(); ++device) {
                 ggml_backend_t backend = ggml_backend_vk_init(device);
                 if (backend == nullptr) {
@@ -13667,6 +16251,19 @@ struct llama_context * llama_new_context_with_model(
             ctx->backends.push_back(backend);
         }
 #endif
+#if defined(GGML_USE_RPC)
+        if (model->n_gpu_layers > 0) {
+            for (const auto & endpoint : model->rpc_servers) {
+                ggml_backend_t backend = ggml_backend_rpc_init(endpoint.c_str());
+                if (backend == nullptr) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize RPC to '%s'\n", __func__, endpoint.c_str());
+                    llama_free(ctx);
+                    return nullptr;
+                }
+                ctx->backends.push_back(backend);
+            }
+        }
+#endif
         ctx->backend_cpu = ggml_backend_cpu_init();
         if (ctx->backend_cpu == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to initialize CPU backend\n", __func__);
@@ -13675,7 +16272,7 @@ struct llama_context * llama_new_context_with_model(
         }
         ctx->backends.push_back(ctx->backend_cpu);
 
-        if (!llama_kv_cache_init(ctx->kv_self, ctx->model, type_k, type_v, kv_size, cparams.offload_kqv)) {
+        if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, kv_size, cparams.offload_kqv)) {
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;
@@ -13701,24 +16298,11 @@ struct llama_context * llama_new_context_with_model(
 
         // graph outputs buffer
         {
-            // resized during inference, reserve maximum
-            ctx->logits_size = hparams.n_vocab*cparams.n_batch;
-            ctx->embd_size = params.embeddings ? hparams.n_embd*cparams.n_batch : 0;
-
-            const size_t buf_output_size = (ctx->logits_size + ctx->embd_size)*sizeof(float);
-
-            ctx->buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), buf_output_size);
-            if (ctx->buf_output == nullptr) {
-                LLAMA_LOG_ERROR("%s: failed to allocate logits buffer\n", __func__);
+            // resized during inference when a batch uses more outputs
+            if (llama_output_reserve(*ctx, params.n_seq_max) < params.n_seq_max) {
+                LLAMA_LOG_ERROR("%s: failed to reserve initial output buffer\n", __func__);
                 llama_free(ctx);
                 return nullptr;
-            }
-            ggml_backend_buffer_clear(ctx->buf_output, 0);
-
-
-            ctx->logits = (float *) ggml_backend_buffer_get_base(ctx->buf_output);
-            if (params.embeddings) {
-                ctx->embd = ctx->logits + ctx->logits_size;
             }
 
             LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
@@ -13743,8 +16327,12 @@ struct llama_context * llama_new_context_with_model(
             ctx->buf_compute_meta.resize(ggml_tensor_overhead()*LLAMA_MAX_NODES + ggml_graph_overhead_custom(LLAMA_MAX_NODES, false));
 
             // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
-            bool pipeline_parallel = llama_get_device_count() > 1 && model->n_gpu_layers > (int)model->hparams.n_layer && model->split_mode == LLAMA_SPLIT_MODE_LAYER;
-#ifndef GGML_USE_CUBLAS
+            bool pipeline_parallel =
+                llama_get_device_count(*model) > 1 &&
+                model->n_gpu_layers > (int)model->hparams.n_layer &&
+                model->split_mode == LLAMA_SPLIT_MODE_LAYER &&
+                params.offload_kqv;
+#ifndef GGML_USE_CUDA
             // pipeline parallelism requires support for async compute and events
             // currently this is only implemented in the CUDA backend
             pipeline_parallel = false;
@@ -13786,20 +16374,6 @@ struct llama_context * llama_new_context_with_model(
         }
     }
 
-#ifdef GGML_USE_MPI
-    ctx->ctx_mpi = ggml_mpi_init();
-
-    if (ggml_mpi_rank(ctx->ctx_mpi) > 0) {
-        // Enter a blocking eval loop with dummy input, letting rank=0 drive the process
-        // TODO: needs fix after #3228
-        GGML_ASSERT(false && "not implemented");
-        //const std::vector<llama_token> tmp(ctx->model.hparams.n_ctx, llama_token_bos(ctx));
-        //while (!llama_eval(ctx, tmp.data(), tmp.size(), 0, 0)) {};
-        llama_backend_free();
-        exit(1);
-    }
-#endif
-
     return ctx;
 }
 
@@ -13836,11 +16410,11 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         // these models do not use RoPE
         case LLM_ARCH_GPT2:
         case LLM_ARCH_GPTJ:
-        case LLM_ARCH_GPTNEOX:
         case LLM_ARCH_MPT:
         case LLM_ARCH_REFACT:
         case LLM_ARCH_BLOOM:
         case LLM_ARCH_MAMBA:
+        case LLM_ARCH_JINA_BERT_V2:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
@@ -13852,21 +16426,28 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_ORION:
         case LLM_ARCH_INTERNLM2:
         case LLM_ARCH_MINICPM:
+        case LLM_ARCH_XVERSE:
         case LLM_ARCH_COMMAND_R:
+        case LLM_ARCH_OLMO:
+        case LLM_ARCH_ARCTIC:
+        case LLM_ARCH_DEEPSEEK2:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2
         case LLM_ARCH_FALCON:
         case LLM_ARCH_GROK:
-        case LLM_ARCH_PERSIMMON:
+        case LLM_ARCH_DBRX:
         case LLM_ARCH_BERT:
         case LLM_ARCH_NOMIC_BERT:
         case LLM_ARCH_STABLELM:
         case LLM_ARCH_QWEN:
         case LLM_ARCH_QWEN2:
+        case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_PHI2:
+        case LLM_ARCH_PHI3:
         case LLM_ARCH_GEMMA:
         case LLM_ARCH_STARCODER2:
+        case LLM_ARCH_GPTNEOX:
             return LLAMA_ROPE_TYPE_NEOX;
 
         // all model arches should be listed explicitly here
@@ -13876,6 +16457,10 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
     }
 
     return LLAMA_ROPE_TYPE_NONE;
+}
+
+enum llama_pooling_type llama_pooling_type(const struct llama_context * ctx) {
+    return ctx->cparams.pooling_type;
 }
 
 int32_t llama_n_vocab(const struct llama_model * model) {
@@ -14022,6 +16607,7 @@ static bool llama_control_vector_init(struct llama_control_vector & cvec, const 
     }
 
     // make tensors
+    cvec.tensors.reserve(model.hparams.n_layer);
     cvec.tensors.push_back(nullptr); // there's never a tensor for layer 0
     for (size_t il = 1; il < model.hparams.n_layer; il++) {
         struct ggml_context * ctx = ctx_map.at(model.buft_layer[il].buft);
@@ -14030,6 +16616,8 @@ static bool llama_control_vector_init(struct llama_control_vector & cvec, const 
     }
 
     // allocate tensors / buffers and zero
+    cvec.ctxs.reserve(ctx_map.size());
+    cvec.bufs.reserve(ctx_map.size());
     for (auto it : ctx_map) {
         ggml_backend_buffer_type_t buft = it.first;
         ggml_context * ctx = it.second;
@@ -14233,30 +16821,61 @@ void llama_kv_cache_update(struct llama_context * ctx) {
     llama_kv_cache_update_internal(*ctx);
 }
 
+// deprecated
+size_t llama_get_state_size(const struct llama_context * ctx) {
+    return llama_state_get_size(ctx);
+}
+
+// deprecated
+size_t llama_copy_state_data(struct llama_context * ctx, uint8_t * dst) {
+    return llama_state_get_data(ctx, dst);
+}
+
+// deprecated
+size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
+    return llama_state_set_data(ctx, src);
+}
+
+// deprecated
+bool llama_load_session_file(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    return llama_state_load_file(ctx, path_session, tokens_out, n_token_capacity, n_token_count_out);
+}
+
+// deprecated
+bool llama_save_session_file(struct llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
+    return llama_state_save_file(ctx, path_session, tokens, n_token_count);
+}
 
 // Returns the *maximum* size of the state
-size_t llama_get_state_size(const struct llama_context * ctx) {
+size_t llama_state_get_size(const struct llama_context * ctx) {
+    const auto & cparams = ctx->cparams;
+    const auto & hparams = ctx->model.hparams;
+
     // we don't know size of rng until we actually serialize it. so reserve more than enough memory for its serialized state.
     // for reference, std::mt19937(1337) serializes to 6701 bytes.
     const size_t s_rng_size        = sizeof(size_t);
     const size_t s_rng             = LLAMA_MAX_RNG_STATE;
+    const size_t s_n_outputs       = sizeof(size_t);
+    // assume worst case for outputs although only currently set ones are serialized
+    const size_t s_output_pos      = ctx->cparams.n_batch * sizeof(int32_t);
     const size_t s_logits_size     = sizeof(size_t);
-    // assume worst case for logits although only currently set ones are serialized
-    const size_t s_logits          = ctx->logits_size * sizeof(float);
+    const size_t s_logits          = ctx->logits_size ? cparams.n_batch * hparams.n_vocab * sizeof(float) : 0;
     const size_t s_embedding_size  = sizeof(size_t);
-    const size_t s_embedding       = ctx->embd_size * sizeof(float);
+    const size_t s_embedding       = ctx->embd_size   ? cparams.n_batch * hparams.n_embd  * sizeof(float) : 0;
     const size_t s_kv_buf_size     = sizeof(size_t);
     const size_t s_kv_head         = sizeof(uint32_t);
     const size_t s_kv_size         = sizeof(uint32_t);
     const size_t s_kv_used         = sizeof(uint32_t);
+    const size_t s_v_trans         = sizeof(uint32_t);
     const size_t s_kv              = ctx->kv_self.total_size();
-    // TODO: assume the max is more than 1 seq_id per KV cell
-    const size_t s_kv_cell         = sizeof(llama_pos) + sizeof(size_t) + sizeof(llama_seq_id);
+    const size_t s_kv_cell         = sizeof(llama_pos) + sizeof(size_t) + cparams.n_seq_max*sizeof(llama_seq_id);
     const size_t s_kv_cells        = ctx->kv_self.size * s_kv_cell;
 
     const size_t s_total = (
         + s_rng_size
         + s_rng
+        + s_n_outputs
+        + s_output_pos
         + s_logits_size
         + s_logits
         + s_embedding_size
@@ -14265,9 +16884,13 @@ size_t llama_get_state_size(const struct llama_context * ctx) {
         + s_kv_head
         + s_kv_size
         + s_kv_used
+        + s_v_trans
         + s_kv
         + s_kv_cells
     );
+
+    // on session change it is very likely that the state size has changed - so we need to update this function
+    static_assert(LLAMA_SESSION_VERSION == 6, "So you just bumped the session version - good. But did you remember to update llama_state_get_size?");
 
     return s_total;
 }
@@ -14317,21 +16940,23 @@ struct llama_data_file_context : llama_data_context {
  * file context:
  * llama_file file("/path", "wb");
  * llama_data_file_context data_ctx(&file);
- * llama_copy_state_data(ctx, &data_ctx);
+ * llama_state_get_data(ctx, &data_ctx);
  *
  * buffer context:
  * std::vector<uint8_t> buf(max_size, 0);
  * llama_data_buffer_context data_ctx(&buf.data());
- * llama_copy_state_data(ctx, &data_ctx);
+ * llama_state_get_data(ctx, &data_ctx);
  *
 */
-static void llama_copy_state_data_internal(struct llama_context * ctx, llama_data_context * data_ctx) {
+static void llama_state_get_data_internal(struct llama_context * ctx, llama_data_context * data_ctx) {
+    llama_synchronize(ctx);
+
     // copy rng
     {
         std::ostringstream rng_ss;
         rng_ss << ctx->rng;
 
-        const std::string & rng_str = rng_ss.str();
+        const std::string & rng_str  = rng_ss.str();
         const size_t        rng_size = rng_str.size();
 
         GGML_ASSERT(rng_size <= LLAMA_MAX_RNG_STATE);
@@ -14340,25 +16965,61 @@ static void llama_copy_state_data_internal(struct llama_context * ctx, llama_dat
         data_ctx->write(rng_str.data(), rng_size);
     }
 
-    // copy logits
+    // copy outputs
     {
-        const size_t logits_size = ctx->logits_size;
+        // Can't use ctx->n_outputs because it's not for the
+        // entire last batch when n_ubatch is smaller than n_batch
+        size_t n_outputs = 0;
 
-        data_ctx->write(&logits_size, sizeof(logits_size));
+        // copy output ids
+        {
+            std::vector<int32_t> output_pos;
 
-        if (logits_size) {
-            data_ctx->write(ctx->logits, logits_size * sizeof(float));
+            const size_t    n_batch = ctx->cparams.n_batch;
+            const auto & output_ids = ctx->output_ids;
+
+            output_pos.resize(ctx->output_size);
+
+            // build a more compact representation of the output ids
+            for (size_t i = 0; i < n_batch; ++i) {
+                // map an output id to a position in the batch
+                int32_t pos = output_ids[i];
+                if (pos >= 0) {
+                    if ((size_t) pos >= n_outputs) {
+                        n_outputs = pos + 1;
+                    }
+                    GGML_ASSERT((size_t) pos < ctx->output_size);
+                    output_pos[pos] = i;
+                }
+            }
+
+            data_ctx->write(&n_outputs, sizeof(n_outputs));
+
+            if (n_outputs) {
+                data_ctx->write(output_pos.data(), n_outputs * sizeof(int32_t));
+            }
         }
-    }
 
-    // copy embeddings
-    {
-        const size_t embeddings_size = ctx->embd_size;
+        // copy logits
+        {
+            const size_t logits_size = std::min(ctx->logits_size, n_outputs * ctx->model.hparams.n_vocab);
 
-        data_ctx->write(&embeddings_size, sizeof(embeddings_size));
+            data_ctx->write(&logits_size, sizeof(logits_size));
 
-        if (embeddings_size) {
-            data_ctx->write(ctx->embd, embeddings_size * sizeof(float));
+            if (logits_size) {
+                data_ctx->write(ctx->logits, logits_size * sizeof(float));
+            }
+        }
+
+        // copy embeddings
+        {
+            const size_t embeddings_size = std::min(ctx->embd_size, n_outputs * ctx->model.hparams.n_embd);
+
+            data_ctx->write(&embeddings_size, sizeof(embeddings_size));
+
+            if (embeddings_size) {
+                data_ctx->write(ctx->embd, embeddings_size * sizeof(float));
+            }
         }
     }
 
@@ -14371,17 +17032,22 @@ static void llama_copy_state_data_internal(struct llama_context * ctx, llama_dat
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa() + hparams.n_embd_k_s();
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa() + hparams.n_embd_v_s();
 
-        const size_t   kv_buf_size = kv_self.total_size();
+        // NOTE: kv_size and kv_buf_size are mostly used for sanity checks
         const uint32_t kv_head     = llama_kv_cache_cell_max(kv_self);
         const uint32_t kv_size     = kv_self.size;
+        const size_t   kv_buf_size = kv_self.total_size() / (kv_size ? kv_size : 1) * kv_head;
         const uint32_t kv_used     = kv_self.used;
+        const uint32_t v_trans     = kv_self.v_trans ? 1 : 0;
 
         data_ctx->write(&kv_buf_size, sizeof(kv_buf_size));
         data_ctx->write(&kv_head,     sizeof(kv_head));
         data_ctx->write(&kv_size,     sizeof(kv_size));
         data_ctx->write(&kv_used,     sizeof(kv_used));
+        data_ctx->write(&v_trans,     sizeof(v_trans));
 
         if (kv_buf_size) {
+            const size_t pre_kv_buf_size = data_ctx->get_size_written();
+
             std::vector<uint8_t> tmp_buf;
             for (int il = 0; il < (int) n_layer; ++il) {
                 const size_t k_size = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*kv_head);
@@ -14390,7 +17056,7 @@ static void llama_copy_state_data_internal(struct llama_context * ctx, llama_dat
                 ggml_backend_tensor_get(kv_self.k_l[il], tmp_buf.data(), 0, tmp_buf.size());
                 data_ctx->write(tmp_buf.data(), tmp_buf.size());
 
-                if (kv_self.recurrent) {
+                if (kv_self.recurrent || !kv_self.v_trans) {
                     // v is contiguous for recurrent models
                     // TODO: use other tensors for state models than k and v
                     const size_t v_size = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa*kv_head);
@@ -14411,6 +17077,7 @@ static void llama_copy_state_data_internal(struct llama_context * ctx, llama_dat
                     data_ctx->write(tmp_buf.data(), tmp_buf.size());
                 }
             }
+            GGML_ASSERT(kv_buf_size == data_ctx->get_size_written() - pre_kv_buf_size);
         }
 
         for (uint32_t i = 0; i < kv_head; ++i) {
@@ -14429,15 +17096,17 @@ static void llama_copy_state_data_internal(struct llama_context * ctx, llama_dat
     }
 }
 
-size_t llama_copy_state_data(struct llama_context * ctx, uint8_t * dst) {
+size_t llama_state_get_data(struct llama_context * ctx, uint8_t * dst) {
     llama_data_buffer_context data_ctx(dst);
-    llama_copy_state_data_internal(ctx, &data_ctx);
+    llama_state_get_data_internal(ctx, &data_ctx);
 
     return data_ctx.get_size_written();
 }
 
 // Sets the state reading from the specified source address
-size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
+size_t llama_state_set_data(struct llama_context * ctx, const uint8_t * src) {
+    llama_synchronize(ctx);
+
     const uint8_t * inp = src;
 
     // set rng
@@ -14453,6 +17122,30 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
         rng_ss >> ctx->rng;
 
         GGML_ASSERT(!rng_ss.fail());
+    }
+
+    // set output ids
+    {
+        size_t n_outputs;
+        std::vector<int32_t> output_pos;
+
+        memcpy(&n_outputs, inp, sizeof(n_outputs)); inp += sizeof(n_outputs);
+
+        GGML_ASSERT(n_outputs <= llama_output_reserve(*ctx, n_outputs));
+
+        if (n_outputs) {
+            output_pos.resize(n_outputs);
+            memcpy(output_pos.data(), inp, n_outputs * sizeof(int32_t));
+            inp += n_outputs * sizeof(int32_t);
+
+            for (int32_t i = 0; i < (int32_t) output_pos.size(); ++i) {
+                int32_t id = output_pos[i];
+                GGML_ASSERT((uint32_t) id < ctx->cparams.n_batch);
+                ctx->output_ids[id] = i;
+            }
+
+            ctx->n_outputs = n_outputs;
+        }
     }
 
     // set logits
@@ -14475,7 +17168,7 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
 
         memcpy(&embeddings_size, inp, sizeof(embeddings_size)); inp += sizeof(embeddings_size);
 
-        GGML_ASSERT(ctx->embd_size == embeddings_size);
+        GGML_ASSERT(ctx->embd_size >= embeddings_size);
 
         if (embeddings_size) {
             memcpy(ctx->embd, inp, embeddings_size * sizeof(float));
@@ -14496,14 +17189,30 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
         uint32_t kv_head;
         uint32_t kv_size;
         uint32_t kv_used;
+        uint32_t v_trans;
 
         memcpy(&kv_buf_size, inp, sizeof(kv_buf_size)); inp += sizeof(kv_buf_size);
         memcpy(&kv_head,     inp, sizeof(kv_head));     inp += sizeof(kv_head);
         memcpy(&kv_size,     inp, sizeof(kv_size));     inp += sizeof(kv_size);
         memcpy(&kv_used,     inp, sizeof(kv_used));     inp += sizeof(kv_used);
+        memcpy(&v_trans,     inp, sizeof(v_trans));     inp += sizeof(v_trans);
+
+        GGML_ASSERT(kv_self.v_trans == (bool) v_trans); // incompatible V transposition
+
+        if (kv_self.size != kv_size) {
+            // the KV cache needs to be big enough to load all the KV cells from the saved state
+            GGML_ASSERT(kv_self.size >= kv_head);
+
+            LLAMA_LOG_INFO("%s: state contains %d KV cells, was saved with kv_size=%d, but is loaded with kv_size=%d (fine, but different)\n",
+                __func__, kv_head, kv_size, kv_self.size);
+        }
+
+        llama_kv_cache_clear(ctx);
 
         if (kv_buf_size) {
-            GGML_ASSERT(kv_self.total_size() == kv_buf_size);
+            const size_t pre_kv_buf_size = inp - src;
+
+            GGML_ASSERT(kv_self.total_size() >= kv_buf_size);
 
             for (int il = 0; il < (int) n_layer; ++il) {
                 const size_t k_size = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*kv_head);
@@ -14511,7 +17220,7 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
                 ggml_backend_tensor_set(kv_self.k_l[il], inp, 0, k_size);
                 inp += k_size;
 
-                if (kv_self.recurrent) {
+                if (kv_self.recurrent || !kv_self.v_trans) {
                     // v is contiguous for recurrent models
                     // TODO: use other tensors for state models than k and v
                     const size_t v_size = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa*kv_head);
@@ -14523,22 +17232,18 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
 
                 // v is not contiguous, copy row by row
                 const size_t v_row_size   = ggml_row_size(kv_self.v_l[il]->type, kv_head);
-                const size_t v_row_stride = ggml_row_size(kv_self.v_l[il]->type, kv_size);
+                const size_t v_row_stride = ggml_row_size(kv_self.v_l[il]->type, kv_self.size);
 
                 for (int ir = 0; ir < (int) n_embd_v_gqa; ++ir) {
                     ggml_backend_tensor_set(kv_self.v_l[il], inp, ir*v_row_stride, v_row_size);
                     inp += v_row_size;
                 }
             }
+            GGML_ASSERT(kv_buf_size == inp - src - pre_kv_buf_size);
         }
 
-        GGML_ASSERT(kv_self.size == kv_size);
-
         ctx->kv_self.head = kv_head;
-        ctx->kv_self.size = kv_size;
         ctx->kv_self.used = kv_used;
-
-        ctx->kv_self.cells.resize(kv_size);
 
         for (uint32_t i = 0; i < kv_head; ++i) {
             llama_pos pos;
@@ -14556,22 +17261,17 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
                 ctx->kv_self.cells[i].seq_id.insert(seq_id);
             }
         }
-
-        for (uint32_t i = kv_head; i < kv_size; ++i) {
-            ctx->kv_self.cells[i].pos = -1;
-            ctx->kv_self.cells[i].seq_id.clear();
-        }
     }
 
     const size_t nread    = inp - src;
-    const size_t max_size = llama_get_state_size(ctx);
+    const size_t max_size = llama_state_get_size(ctx);
 
     GGML_ASSERT(nread <= max_size);
 
     return nread;
 }
 
-static bool llama_load_session_file_internal(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+static bool llama_state_load_file_internal(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(path_session, "rb");
 
     // sanity checks
@@ -14609,7 +17309,7 @@ static bool llama_load_session_file_internal(struct llama_context * ctx, const c
     // restore the context state
     {
         const size_t n_state_size_cur = file.size - file.tell();
-        const size_t n_state_size_max = llama_get_state_size(ctx);
+        const size_t n_state_size_max = llama_state_get_size(ctx);
 
         if (n_state_size_cur > n_state_size_max) {
             LLAMA_LOG_ERROR("%s : the state size in session file is too big! max %zu, got %zu\n", __func__, n_state_size_max, n_state_size_cur);
@@ -14619,22 +17319,22 @@ static bool llama_load_session_file_internal(struct llama_context * ctx, const c
         std::vector<uint8_t> state_data(n_state_size_max);
         file.read_raw(state_data.data(), n_state_size_cur);
 
-        llama_set_state_data(ctx, state_data.data());
+        llama_state_set_data(ctx, state_data.data());
     }
 
     return true;
 }
 
-bool llama_load_session_file(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+bool llama_state_load_file(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     try {
-        return llama_load_session_file_internal(ctx, path_session, tokens_out, n_token_capacity, n_token_count_out);
+        return llama_state_load_file_internal(ctx, path_session, tokens_out, n_token_capacity, n_token_count_out);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("error loading session file: %s\n", err.what());
         return false;
     }
 }
 
-bool llama_save_session_file(struct llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
+static bool llama_state_save_file_internal(struct llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
     llama_file file(path_session, "wb");
 
     file.write_u32(LLAMA_SESSION_MAGIC);
@@ -14648,14 +17348,490 @@ bool llama_save_session_file(struct llama_context * ctx, const char * path_sessi
 
     // save the context state using stream saving
     llama_data_file_context data_ctx(&file);
-    llama_copy_state_data_internal(ctx, &data_ctx);
+    llama_state_get_data_internal(ctx, &data_ctx);
 
     return true;
+}
+
+bool llama_state_save_file(struct llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
+    try {
+        return llama_state_save_file_internal(ctx, path_session, tokens, n_token_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("error saving session file: %s\n", err.what());
+        return false;
+    }
+}
+
+size_t llama_state_seq_get_size(struct llama_context* ctx, llama_seq_id seq_id) {
+    // save the size of size_t as a uint32_t for safety check
+    const size_t size_t_size_size = sizeof(uint32_t);
+
+    // other values
+    const size_t s_cell_count_size = sizeof(uint32_t);
+    const size_t s_layer_count_size = sizeof(uint32_t);
+    const size_t n_embd_v_gqa_size = sizeof(uint32_t);
+
+    size_t s_cell_count = 0;
+    size_t s_cell_data_size = 0;
+    const auto & kv_self = ctx->kv_self;
+    const auto & hparams = ctx->model.hparams;
+
+    const uint32_t n_layer = hparams.n_layer;
+    const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa() + hparams.n_embd_k_s();
+    const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa() + hparams.n_embd_v_s();
+
+    for (uint32_t i = 0; i < kv_self.size; ++i) {
+        const auto & cell = kv_self.cells[i];
+        if (cell.seq_id.count(seq_id) > 0) {
+            ++s_cell_count;
+            s_cell_data_size += sizeof(llama_pos);
+        }
+    }
+
+    for (int il = 0; il < (int)n_layer; ++il) {
+        // types of keys and values
+        s_cell_data_size += sizeof(int32_t) * 2;
+        // k_size_row and v_size_el values of layer
+        s_cell_data_size += sizeof(size_t) * 2;
+
+        // keys
+        const size_t k_size_row = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa);
+        s_cell_data_size += k_size_row * s_cell_count;
+
+        // values (transposed)
+        const size_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
+        s_cell_data_size += v_size_el * s_cell_count * n_embd_v_gqa;
+    }
+
+    const size_t s_total = (
+        size_t_size_size +
+        s_cell_count_size +
+        s_layer_count_size +
+        n_embd_v_gqa_size +
+        s_cell_data_size
+        );
+
+    return s_total;
+}
+
+static size_t llama_state_seq_get_data_internal(struct llama_context * ctx, llama_data_context & data_ctx, llama_seq_id seq_id) {
+    llama_synchronize(ctx);
+
+    const auto & kv_self = ctx->kv_self;
+    GGML_ASSERT(!kv_self.recurrent); // not implemented
+
+    // Save the size of size_t as a uint32_t for safety check
+    const uint32_t size_t_size = sizeof(size_t);
+    data_ctx.write(&size_t_size, sizeof(size_t_size));
+
+    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
+    uint32_t cell_count = 0;
+
+    // Count the number of cells with the specified seq_id
+    // Find all the ranges of cells with this seq id
+    {
+        uint32_t cell_range_begin = kv_self.size;
+        for (uint32_t i = 0; i < kv_self.size; ++i) {
+            const auto & cell = kv_self.cells[i];
+            if (cell.has_seq_id(seq_id)) {
+                ++cell_count;
+                if (cell_range_begin == kv_self.size) {
+                    cell_range_begin = i;
+                }
+            }
+            else {
+                if (cell_range_begin != kv_self.size) {
+                    cell_ranges.emplace_back(cell_range_begin, i);
+                    cell_range_begin = kv_self.size;
+                }
+            }
+        }
+        if (cell_range_begin != kv_self.size) {
+            cell_ranges.emplace_back(cell_range_begin, kv_self.size);
+        }
+
+        // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
+        uint32_t cell_count_check = 0;
+        for (const auto & range : cell_ranges) {
+            cell_count_check += range.second - range.first;
+        }
+        GGML_ASSERT(cell_count == cell_count_check);
+    }
+
+    // Write the cell count
+    data_ctx.write(&cell_count, sizeof(cell_count));
+
+    const auto & hparams = ctx->model.hparams;
+    const uint32_t n_layer = hparams.n_layer;
+    const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa() + hparams.n_embd_k_s();
+    const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa() + hparams.n_embd_v_s();
+
+    // Write the layer count
+    data_ctx.write(&n_layer, sizeof(n_layer));
+
+    // Write n_embd_v_gqa
+    data_ctx.write(&n_embd_v_gqa, sizeof(n_embd_v_gqa));
+
+    // Iterate the ranges and write all the pos (this is the token position in the prompt)
+    for (const auto & range : cell_ranges) {
+        for (uint32_t i = range.first; i < range.second; ++i) {
+            const auto & cell = kv_self.cells[i];
+            data_ctx.write(&cell.pos, sizeof(cell.pos));
+        }
+    }
+
+    // Iterate and write all the keys first, each row is a cell
+    // Get whole range at a time
+    std::vector<uint8_t> tmp_buf;
+    for (int il = 0; il < (int)n_layer; ++il) {
+        // Write key type
+        const int32_t k_type_i = (int32_t)kv_self.k_l[il]->type;
+        data_ctx.write(&k_type_i, sizeof(k_type_i));
+
+        // Write row size of key
+        const size_t k_size_row = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa);
+        data_ctx.write(&k_size_row, sizeof(k_size_row));
+
+        // Read each range of cells of k_size length each into tmp_buf and write out
+        for (const auto & range : cell_ranges) {
+            const size_t range_size = range.second - range.first;
+            tmp_buf.resize(range_size * k_size_row);
+            ggml_backend_tensor_get(kv_self.k_l[il], tmp_buf.data(), range.first * k_size_row, range_size * k_size_row);
+            data_ctx.write(tmp_buf.data(), tmp_buf.size());
+        }
+    }
+
+    // TODO: simplify, reduce copy-paste
+    if (!kv_self.v_trans) {
+        for (int il = 0; il < (int)n_layer; ++il) {
+            // Write value type
+            const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
+            data_ctx.write(&v_type_i, sizeof(v_type_i));
+
+            // Write row size of value
+            const size_t v_size_row = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa);
+            data_ctx.write(&v_size_row, sizeof(v_size_row));
+
+            // Read each range of cells of v_size length each into tmp_buf and write out
+            for (const auto & range : cell_ranges) {
+                const size_t range_size = range.second - range.first;
+                tmp_buf.resize(range_size * v_size_row);
+                ggml_backend_tensor_get(kv_self.v_l[il], tmp_buf.data(), range.first * v_size_row, range_size * v_size_row);
+                data_ctx.write(tmp_buf.data(), tmp_buf.size());
+            }
+        }
+    } else {
+        // For the values, they are transposed, so we also need the element size and get the element ranges from each row
+        const uint32_t kv_size = kv_self.size;
+        for (int il = 0; il < (int)n_layer; ++il) {
+            // Write value type
+            const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
+            data_ctx.write(&v_type_i, sizeof(v_type_i));
+
+            // Write element size
+            const size_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
+            data_ctx.write(&v_size_el, sizeof(v_size_el));
+
+            // For each row, we get the element values of each cell
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                // Read each range of cells of v_size_el length each into tmp_buf and write out
+                for (const auto & range : cell_ranges) {
+                    const size_t range_size = range.second - range.first;
+                    const size_t src_offset = (range.first + j * kv_size) * v_size_el;
+                    tmp_buf.resize(range_size * v_size_el);
+                    ggml_backend_tensor_get(kv_self.v_l[il], tmp_buf.data(), src_offset, tmp_buf.size());
+                    data_ctx.write(tmp_buf.data(), tmp_buf.size());
+                }
+            }
+        }
+    }
+
+    return data_ctx.get_size_written();
+}
+
+size_t llama_state_seq_get_data(struct llama_context* ctx, uint8_t* dst, llama_seq_id seq_id) {
+    llama_data_buffer_context data_ctx(dst);
+    return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id);
+}
+
+size_t llama_state_seq_set_data(struct llama_context * ctx, const uint8_t * src, llama_seq_id dest_seq_id) {
+    llama_synchronize(ctx);
+
+    auto & kv_self = ctx->kv_self;
+    GGML_ASSERT(!kv_self.recurrent); // not implemented
+
+    // Wipe the slot
+    llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+
+    const uint8_t * inp = src;
+
+    // Read size of size_t
+    uint32_t size_t_size;
+    memcpy(&size_t_size, inp, sizeof(size_t_size));
+    inp += sizeof(size_t_size);
+    if (size_t_size != sizeof(size_t)) {
+        LLAMA_LOG_ERROR("%s: size_t size mismatch\n", __func__);
+        return 0;
+    }
+
+    // Read the cell count
+    uint32_t cell_count;
+    memcpy(&cell_count, inp, sizeof(cell_count));
+    inp += sizeof(cell_count);
+
+    // Read the layer count
+    uint32_t n_layer_ref;
+    memcpy(&n_layer_ref, inp, sizeof(n_layer_ref));
+    inp += sizeof(n_layer_ref);
+
+    // Read n_embd_v_gqa
+    uint32_t n_embd_v_gqa_ref;
+    memcpy(&n_embd_v_gqa_ref, inp, sizeof(n_embd_v_gqa_ref));
+    inp += sizeof(n_embd_v_gqa_ref);
+
+    // Sanity check model compatibility
+    const auto & hparams = ctx->model.hparams;
+    const uint32_t n_layer = hparams.n_layer;
+    const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa() + hparams.n_embd_k_s();
+    const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa() + hparams.n_embd_v_s();
+    if (n_layer != n_layer_ref) {
+        LLAMA_LOG_ERROR("%s: mismatched n_layer (%d != %d)\n", __func__, n_layer, n_layer_ref);
+        return 0;
+    }
+    if (n_embd_v_gqa != n_embd_v_gqa_ref) {
+        LLAMA_LOG_ERROR("%s: mismatched n_embd_v_gqa (%d != %d)\n", __func__, n_embd_v_gqa, n_embd_v_gqa_ref);
+        return 0;
+    }
+
+    // Allocate the new cells for the slot
+    if (cell_count) {
+        llama_batch batch = llama_batch_init(cell_count, 0, 1);
+        batch.n_tokens = cell_count;
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            llama_pos pos;
+            memcpy(&pos, inp, sizeof(pos));
+            inp += sizeof(pos);
+
+            batch.pos[i] = pos;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = dest_seq_id;
+        }
+        if (!llama_kv_cache_find_slot(kv_self, batch)) {
+            llama_batch_free(batch);
+            LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
+            return 0;
+        }
+
+        // DEBUG CHECK: kv_self.head should be our first cell, kv_self.head + cell_count - 1 should be our last cell (verify seq_id and pos values)
+        // Assume that this is one contiguous block of cells
+        GGML_ASSERT(kv_self.head + cell_count <= kv_self.size);
+        GGML_ASSERT(kv_self.cells[kv_self.head].pos == batch.pos[0]);
+        GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].pos == batch.pos[cell_count - 1]);
+        GGML_ASSERT(kv_self.cells[kv_self.head].has_seq_id(dest_seq_id));
+        GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].has_seq_id(dest_seq_id));
+
+        // Cleanup
+        llama_batch_free(batch);
+    }
+
+    const uint32_t kv_size = kv_self.size;
+    const uint32_t kv_head = kv_self.head;
+
+    // For each layer, read the keys for each cell, one row is one cell, read as one contiguous blo
+    for (int il = 0; il < (int)n_layer; ++il) {
+        // Read type of key
+        int32_t k_type_i_ref;
+        memcpy(&k_type_i_ref, inp, sizeof(k_type_i_ref));
+        inp += sizeof(k_type_i_ref);
+        const int32_t k_type_i = (int32_t)kv_self.k_l[il]->type;
+        if (k_type_i != k_type_i_ref) {
+            llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+            LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
+            return 0;
+        }
+
+        // Read row size of key
+        size_t k_size_row_ref;
+        memcpy(&k_size_row_ref, inp, sizeof(k_size_row_ref));
+        inp += sizeof(k_size_row_ref);
+        const size_t k_size_row = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa);
+        if (k_size_row != k_size_row_ref) {
+            llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+            LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, k_size_row_ref, il);
+            return 0;
+        }
+
+        if (cell_count) {
+            // Read and set the keys for the whole cell range
+            ggml_backend_tensor_set(kv_self.k_l[il], inp, kv_head * k_size_row, cell_count * k_size_row);
+            inp += cell_count * k_size_row;
+        }
+    }
+
+    // TODO: simplify, reduce copy-paste
+    if (!kv_self.v_trans) {
+        for (int il = 0; il < (int)n_layer; ++il) {
+            // Read type of value
+            int32_t v_type_i_ref;
+            memcpy(&v_type_i_ref, inp, sizeof(v_type_i_ref));
+            inp += sizeof(v_type_i_ref);
+            const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
+            if (v_type_i != v_type_i_ref) {
+                llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
+                return 0;
+            }
+
+            // Read row size of value
+            size_t v_size_row_ref;
+            memcpy(&v_size_row_ref, inp, sizeof(v_size_row_ref));
+            inp += sizeof(v_size_row_ref);
+            const size_t v_size_row = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa);
+            if (v_size_row != v_size_row_ref) {
+                llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+                LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, v_size_row_ref, il);
+                return 0;
+            }
+
+            if (cell_count) {
+                // Read and set the values for the whole cell range
+                ggml_backend_tensor_set(kv_self.v_l[il], inp, kv_head * v_size_row, cell_count * v_size_row);
+                inp += cell_count * v_size_row;
+            }
+        }
+    } else {
+        // For each layer, read the values for each cell (transposed)
+        for (int il = 0; il < (int)n_layer; ++il) {
+            // Read type of value
+            int32_t v_type_i_ref;
+            memcpy(&v_type_i_ref, inp, sizeof(v_type_i_ref));
+            inp += sizeof(v_type_i_ref);
+            const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
+            if (v_type_i != v_type_i_ref) {
+                llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
+                return 0;
+            }
+
+            // Read element size of value
+            size_t v_size_el_ref;
+            memcpy(&v_size_el_ref, inp, sizeof(v_size_el_ref));
+            inp += sizeof(v_size_el_ref);
+            const size_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
+            if (v_size_el != v_size_el_ref) {
+                llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+                LLAMA_LOG_ERROR("%s: mismatched value element size (%zu != %zu, layer %d)\n", __func__, v_size_el, v_size_el_ref, il);
+                return 0;
+            }
+
+            if (cell_count) {
+                // For each row in the transposed matrix, read the values for the whole cell range
+                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    const size_t dst_offset = (kv_head + j * kv_size) * v_size_el;
+                    ggml_backend_tensor_set(kv_self.v_l[il], inp, dst_offset, cell_count * v_size_el);
+                    inp += cell_count * v_size_el;
+                }
+            }
+        }
+    }
+
+    const size_t nread = inp - src;
+
+    return nread;
+}
+
+static size_t llama_state_seq_save_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    llama_file file(filepath, "wb");
+
+    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
+    file.write_u32(LLAMA_STATE_SEQ_VERSION);
+
+    // save the prompt
+    file.write_u32((uint32_t)n_token_count);
+    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
+
+    // save the context state using stream saving
+    llama_data_file_context data_ctx(&file);
+    llama_state_seq_get_data_internal(ctx, data_ctx, seq_id);
+
+    const size_t res = file.tell();
+    GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + data_ctx.get_size_written());
+    return res;
+}
+
+static size_t llama_state_seq_load_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    llama_file file(filepath, "rb");
+
+    // version checks
+    {
+        const uint32_t magic   = file.read_u32();
+        const uint32_t version = file.read_u32();
+
+        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+            LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
+            return 0;
+        }
+    }
+
+    // load the prompt
+    {
+        const uint32_t n_token_count = file.read_u32();
+
+        if (n_token_count > n_token_capacity) {
+            LLAMA_LOG_ERROR("%s: token count in sequence state file exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
+            return 0;
+        }
+
+        file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
+        *n_token_count_out = n_token_count;
+    }
+
+    // restore the context state
+    {
+        const size_t state_size = file.size - file.tell();
+        std::vector<uint8_t> state_data(state_size);
+        file.read_raw(state_data.data(), state_size);
+        const size_t nread = llama_state_seq_set_data(ctx, state_data.data(), dest_seq_id);
+        if (!nread) {
+            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
+            return 0;
+        }
+        GGML_ASSERT(nread <= state_size);
+        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
+    }
+
+    return file.tell();
+}
+
+size_t llama_state_seq_save_file(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    try {
+        return llama_state_seq_save_file_internal(ctx, filepath, seq_id, tokens, n_token_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("error saving sequence state file: %s\n", err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_load_file(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    try {
+        return llama_state_seq_load_file_internal(ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("error loading sequence state file: %s\n", err.what());
+        return 0;
+    }
 }
 
 void llama_set_n_threads(struct llama_context * ctx, uint32_t n_threads, uint32_t n_threads_batch) {
     ctx->cparams.n_threads       = n_threads;
     ctx->cparams.n_threads_batch = n_threads_batch;
+}
+
+uint32_t llama_n_threads(struct llama_context * ctx) {
+    return ctx->cparams.n_threads;
+}
+
+uint32_t llama_n_threads_batch(struct llama_context * ctx) {
+    return ctx->cparams.n_threads_batch;
 }
 
 void llama_set_abort_callback(struct llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
@@ -14766,11 +17942,41 @@ float * llama_get_logits(struct llama_context * ctx) {
 }
 
 float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
-    assert(ctx->logits_valid.at(i));
-
+    int32_t j = -1;
     llama_synchronize(ctx);
 
-    return ctx->logits + i*ctx->model.hparams.n_vocab;
+    try {
+        if (ctx->logits == nullptr) {
+            throw std::runtime_error("no logits");
+        }
+
+        if (i < 0) {
+            j = ctx->n_outputs + i;
+            if (j < 0) {
+                throw std::runtime_error(format("negative index out of range [0, %d)", ctx->n_outputs));
+            }
+        } else if ((size_t) i >= ctx->output_ids.size()) {
+            throw std::runtime_error(format("out of range [0, %lu)", ctx->output_ids.size()));
+        } else {
+            j = ctx->output_ids[i];
+        }
+
+        if (j < 0) {
+            throw std::runtime_error(format("batch.logits[%d] != true", i));
+        }
+        if (j >= ctx->n_outputs) {
+            // This should not happen
+            throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, ctx->n_outputs));
+        }
+
+        return ctx->logits + j*ctx->model.hparams.n_vocab;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ASSERT(false);
+#endif
+        return nullptr;
+    }
 }
 
 float * llama_get_embeddings(struct llama_context * ctx) {
@@ -14780,9 +17986,42 @@ float * llama_get_embeddings(struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i) {
+    int32_t j = -1;
+
     llama_synchronize(ctx);
 
-    return ctx->embd + i*ctx->model.hparams.n_embd;
+    try {
+        if (ctx->embd == nullptr) {
+            throw std::runtime_error("no embeddings");
+        }
+
+        if (i < 0) {
+            j = ctx->n_outputs + i;
+            if (j < 0) {
+                throw std::runtime_error(format("negative index out of range [0, %d)", ctx->n_outputs));
+            }
+        } else if ((size_t) i >= ctx->output_ids.size()) {
+            throw std::runtime_error(format("out of range [0, %lu)", ctx->output_ids.size()));
+        } else {
+            j = ctx->output_ids[i];
+        }
+
+        if (j < 0) {
+            throw std::runtime_error(format("batch.logits[%d] != true", i));
+        }
+        if (j >= ctx->n_outputs) {
+            // This should not happen
+            throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, ctx->n_outputs));
+        }
+
+        return ctx->embd + j*ctx->model.hparams.n_embd;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid embeddings id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ASSERT(false);
+#endif
+        return nullptr;
+    }
 }
 
 float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id) {
@@ -14806,9 +18045,20 @@ float llama_token_get_score(const struct llama_model * model, llama_token token)
     return model->vocab.id_to_token[token].score;
 }
 
-llama_token_type llama_token_get_type(const struct llama_model * model, llama_token token) {
+llama_token_attr llama_token_get_attr(const struct llama_model * model, llama_token token) {
     GGML_ASSERT(model->vocab.type != LLAMA_VOCAB_TYPE_NONE);
-    return model->vocab.id_to_token[token].type;
+    return model->vocab.id_to_token[token].attr;
+}
+
+bool llama_token_is_eog(const struct llama_model * model, llama_token token) {
+    return token != -1 && (
+        token == llama_token_eos(model) ||
+        token == llama_token_eot(model)
+    );
+}
+
+bool llama_token_is_control(const struct llama_model * model, llama_token token) {
+    return llama_is_control_token(model->vocab, token);
 }
 
 llama_token llama_token_bos(const struct llama_model * model) {
@@ -14817,6 +18067,14 @@ llama_token llama_token_bos(const struct llama_model * model) {
 
 llama_token llama_token_eos(const struct llama_model * model) {
     return model->vocab.special_eos_id;
+}
+
+llama_token llama_token_cls(const struct llama_model * model) {
+    return model->vocab.special_cls_id;
+}
+
+llama_token llama_token_sep(const struct llama_model * model) {
+    return model->vocab.special_sep_id;
 }
 
 llama_token llama_token_nl(const struct llama_model * model) {
@@ -14853,9 +18111,9 @@ int32_t llama_tokenize(
                      int32_t   text_len,
                  llama_token * tokens,
                      int32_t   n_tokens_max,
-                        bool   add_bos,
-                        bool   special) {
-    auto res = llama_tokenize_internal(model->vocab, std::string(text, text_len), add_bos, special);
+                        bool   add_special,
+                        bool   parse_special) {
+    auto res = llama_tokenize_internal(model->vocab, std::string(text, text_len), add_special, parse_special);
 
     if (n_tokens_max < (int) res.size()) {
         // LLAMA_LOG_ERROR("%s: too many tokens\n", __func__);
@@ -14871,79 +18129,108 @@ int32_t llama_tokenize(
 
 static std::string llama_decode_text(const std::string & text) {
     std::string decoded_text;
-    auto unicode_sequences = unicode_cpts_from_utf8(text);
-    for (auto & unicode_sequence : unicode_sequences) {
-        decoded_text += unicode_utf8_to_byte(unicode_cpt_to_utf8(unicode_sequence));
+
+    const auto cpts = unicode_cpts_from_utf8(text);
+    for (const auto cpt : cpts) {
+        const auto utf8 = unicode_cpt_to_utf8(cpt);
+        try {
+            decoded_text += unicode_utf8_to_byte(utf8);
+        } catch (const std::out_of_range & e) {
+            decoded_text += "[UNK_BYTE_0x";
+            for (const auto c : utf8) {
+                decoded_text += format("%02x", (uint8_t) c);
+            }
+            decoded_text += text + "]";
+        }
     }
 
     return decoded_text;
 }
 
 // does not write null-terminator to buf
-int32_t llama_token_to_piece(const struct llama_model * model, llama_token token, char * buf, int32_t length) {
+int32_t llama_token_to_piece(const struct llama_model * model, llama_token token, char * buf, int32_t length, bool special) {
+    // ref: https://github.com/ggerganov/llama.cpp/pull/7587#discussion_r1620983843
+    if (!special && llama_is_control_token(model->vocab, token)) {
+        return 0;
+    }
+
+    // if we have a cache - use it
+    {
+        const auto & cache = model->vocab.cache_token_to_piece;
+
+        if (!cache.empty()) {
+            const auto & res = cache.at(token);
+            if (length < (int) res.size()) {
+                return -(int) res.size();
+            }
+            memcpy(buf, res.c_str(), res.size());
+            return res.size();
+        }
+    }
+
     if (0 <= token && token < llama_n_vocab(model)) {
         switch (llama_vocab_get_type(model->vocab)) {
-        case LLAMA_VOCAB_TYPE_WPM:
-        case LLAMA_VOCAB_TYPE_SPM: {
-            // NOTE: we accept all unsupported token types,
-            // suppressing them like CONTROL tokens.
-            if (llama_is_normal_token(model->vocab, token)) {
-                std::string result = model->vocab.id_to_token[token].text;
-                llama_unescape_whitespace(result);
-                if (length < (int) result.length()) {
-                    return -(int) result.length();
+            case LLAMA_VOCAB_TYPE_WPM:
+            case LLAMA_VOCAB_TYPE_SPM: {
+                // NOTE: we accept all unsupported token types,
+                // suppressing them like CONTROL tokens.
+                if (llama_is_normal_token(model->vocab, token)) {
+                    std::string result = model->vocab.id_to_token[token].text;
+                    llama_unescape_whitespace(result);
+                    if (length < (int) result.length()) {
+                        return -(int) result.length();
+                    }
+                    memcpy(buf, result.c_str(), result.length());
+                    return result.length();
+                } else if (
+                        (llama_is_user_defined_token(model->vocab, token)) ||
+                        (llama_is_control_token     (model->vocab, token) && special)) {
+                    std::string result = model->vocab.id_to_token[token].text;
+                    if (length < (int) result.length()) {
+                        return -(int) result.length();
+                    }
+                    memcpy(buf, result.c_str(), result.length());
+                    return result.length();
+                } else if (llama_is_unknown_token(model->vocab, token)) { // NOLINT
+                    if (length < 3) {
+                        return -3;
+                    }
+                    memcpy(buf, "\xe2\x96\x85", 3);
+                    return 3;
+                } else if (llama_is_byte_token(model->vocab, token)) {
+                    if (length < 1) {
+                        return -1;
+                    }
+                    buf[0] = llama_token_to_byte(model->vocab, token);
+                    return 1;
                 }
-                memcpy(buf, result.c_str(), result.length());
-                return result.length();
-            } else if (llama_is_user_defined_token(model->vocab, token)) {
-                std::string result = model->vocab.id_to_token[token].text;
-                if (length < (int) result.length()) {
-                    return -(int) result.length();
-                }
-                memcpy(buf, result.c_str(), result.length());
-                return result.length();
-            } else if (llama_is_unknown_token(model->vocab, token)) { // NOLINT
-                if (length < 3) {
-                    return -3;
-                }
-                memcpy(buf, "\xe2\x96\x85", 3);
-                return 3;
-            } else if (llama_is_control_token(model->vocab, token)) {
-                ;
-            } else if (llama_is_byte_token(model->vocab, token)) {
-                if (length < 1) {
-                    return -1;
-                }
-                buf[0] = llama_token_to_byte(model->vocab, token);
-                return 1;
+                break;
             }
-            break;
-        }
-        case LLAMA_VOCAB_TYPE_BPE: {
-            // NOTE: we accept all unsupported token types,
-            // suppressing them like CONTROL tokens.
-            if (llama_is_normal_token(model->vocab, token)) {
-                std::string result = model->vocab.id_to_token[token].text;
-                result = llama_decode_text(result);
-                if (length < (int) result.length()) {
-                    return -(int) result.length();
+            case LLAMA_VOCAB_TYPE_BPE: {
+                // NOTE: we accept all unsupported token types,
+                // suppressing them like CONTROL tokens.
+                if (llama_is_normal_token(model->vocab, token)) {
+                    std::string result = model->vocab.id_to_token[token].text;
+                    result = llama_decode_text(result);
+                    if (length < (int) result.length()) {
+                        return -(int) result.length();
+                    }
+                    memcpy(buf, result.c_str(), result.length());
+                    return result.length();
+                } else if (
+                        (llama_is_user_defined_token(model->vocab, token)) ||
+                        (llama_is_control_token     (model->vocab, token) && special)) {
+                    std::string result = model->vocab.id_to_token[token].text;
+                    if (length < (int) result.length()) {
+                        return -(int) result.length();
+                    }
+                    memcpy(buf, result.c_str(), result.length());
+                    return result.length();
                 }
-                memcpy(buf, result.c_str(), result.length());
-                return result.length();
-            } else if (llama_is_user_defined_token(model->vocab, token)) {
-                std::string result = model->vocab.id_to_token[token].text;
-                if (length < (int) result.length()) {
-                    return -(int) result.length();
-                }
-                memcpy(buf, result.c_str(), result.length());
-                return result.length();
-            } else if (llama_is_control_token(model->vocab, token)) {
-                ;
+                break;
             }
-            break;
-        }
-        default:
-            GGML_ASSERT(false);
+            default:
+                GGML_ASSERT(false);
         }
     }
     return 0;
@@ -15013,6 +18300,15 @@ static int32_t llama_chat_apply_template_internal(
             }
         }
         // llama2 templates seem to not care about "add_generation_prompt"
+    } else if (tmpl == "phi3" || (tmpl.find("<|assistant|>") != std::string::npos && tmpl.find("<|end|>") != std::string::npos)) {
+        // Phi 3
+        for (auto message : chat) {
+            std::string role(message->role);
+            ss << "<|" << role << "|>\n" << message->content << "<|end|>\n";
+        }
+        if (add_ass) {
+            ss << "<|assistant|>\n";
+        }
     } else if (tmpl == "zephyr" || tmpl.find("<|user|>") != std::string::npos) {
         // zephyr template
         for (auto message : chat) {
@@ -15071,6 +18367,79 @@ static int32_t llama_chat_apply_template_internal(
             } else {
                 ss << message->content << "</s>";
             }
+        }
+    } else if (tmpl == "openchat" || tmpl.find("GPT4 Correct ") != std::string::npos) {
+        // openchat/openchat-3.5-0106,
+        for (auto message : chat) {
+            std::string role(message->role);
+            if (role == "system") {
+                ss << message->content << "<|end_of_turn|>";
+            } else {
+                role[0] = toupper(role[0]);
+                ss << "GPT4 Correct " << role << ": " << message->content << "<|end_of_turn|>";
+            }
+        }
+        if (add_ass) {
+            ss << "GPT4 Correct Assistant:";
+        }
+    } else if (tmpl == "vicuna" || tmpl == "vicuna-orca" || (tmpl.find("USER: ") != std::string::npos && tmpl.find("ASSISTANT: ") != std::string::npos)) {
+        // eachadea/vicuna-13b-1.1 (and Orca variant)
+        for (auto message : chat) {
+            std::string role(message->role);
+            if (role == "system") {
+                // Orca-Vicuna variant uses a system prefix
+                if (tmpl == "vicuna-orca" || tmpl.find("SYSTEM: ") != std::string::npos) {
+                    ss << "SYSTEM: " << message->content << "\n";
+                } else {
+                    ss << message->content << "\n\n";
+                }
+            } else if (role == "user") {
+                ss << "USER: " << message->content << "\n";
+            } else if (role == "assistant") {
+                ss << "ASSISTANT: " << message->content << "</s>\n";
+            }
+        }
+        if (add_ass) {
+            ss << "ASSISTANT:";
+        }
+    } else if (tmpl == "deepseek" || (tmpl.find("### Instruction:") != std::string::npos && tmpl.find("<|EOT|>") != std::string::npos)) {
+        // deepseek-ai/deepseek-coder-33b-instruct
+        for (auto message : chat) {
+            std::string role(message->role);
+            if (role == "system") {
+                ss << message->content;
+            } else if (role == "user") {
+                ss << "### Instruction:\n" << message->content << "\n";
+            } else if (role == "assistant") {
+                ss << "### Response:\n" << message->content << "\n<|EOT|>\n";
+            }
+        }
+        if (add_ass) {
+            ss << "### Response:\n";
+        }
+    } else if (tmpl == "command-r" || (tmpl.find("<|START_OF_TURN_TOKEN|>") != std::string::npos && tmpl.find("<|USER_TOKEN|>") != std::string::npos)) {
+        // CohereForAI/c4ai-command-r-plus
+        for (auto message : chat) {
+            std::string role(message->role);
+            if (role == "system") {
+                ss << "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>" << trim(message->content) << "<|END_OF_TURN_TOKEN|>";
+            } else if (role == "user") {
+                ss << "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>" << trim(message->content) << "<|END_OF_TURN_TOKEN|>";
+            } else if (role == "assistant") {
+                ss << "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>" << trim(message->content) << "<|END_OF_TURN_TOKEN|>";
+            }
+        }
+        if (add_ass) {
+            ss << "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>";
+        }
+    } else if (tmpl == "llama3" || (tmpl.find("<|start_header_id|>") != std::string::npos && tmpl.find("<|end_header_id|>") != std::string::npos)) {
+        // Llama 3
+        for (auto message : chat) {
+            std::string role(message->role);
+            ss << "<|start_header_id|>" << role << "<|end_header_id|>\n\n" << trim(message->content) << "<|eot_id|>";
+        }
+        if (add_ass) {
+            ss << "<|start_header_id|>assistant<|end_header_id|>\n\n";
         }
     } else {
         // template not supported
@@ -15155,7 +18524,7 @@ struct llama_timings llama_get_timings(struct llama_context * ctx) {
         /*.t_eval_ms   =*/ 1e-3 * ctx->t_eval_us,
 
         /*.n_sample =*/ std::max(1, ctx->n_sample),
-        /*.n_p_eval =*/ std::max(1, ctx->n_p_eval),
+        /*.n_p_eval =*/ std::max(0, ctx->n_p_eval),
         /*.n_eval   =*/ std::max(1, ctx->n_eval),
     };
 
@@ -15193,8 +18562,10 @@ const char * llama_print_system_info(void) {
     s += "AVX512 = "      + std::to_string(ggml_cpu_has_avx512())      + " | ";
     s += "AVX512_VBMI = " + std::to_string(ggml_cpu_has_avx512_vbmi()) + " | ";
     s += "AVX512_VNNI = " + std::to_string(ggml_cpu_has_avx512_vnni()) + " | ";
+    s += "AVX512_BF16 = " + std::to_string(ggml_cpu_has_avx512_bf16()) + " | ";
     s += "FMA = "         + std::to_string(ggml_cpu_has_fma())         + " | ";
     s += "NEON = "        + std::to_string(ggml_cpu_has_neon())        + " | ";
+    s += "SVE = "         + std::to_string(ggml_cpu_has_sve())         + " | ";
     s += "ARM_FMA = "     + std::to_string(ggml_cpu_has_arm_fma())     + " | ";
     s += "F16C = "        + std::to_string(ggml_cpu_has_f16c())        + " | ";
     s += "FP16_VA = "     + std::to_string(ggml_cpu_has_fp16_va())     + " | ";
@@ -15204,6 +18575,11 @@ const char * llama_print_system_info(void) {
     s += "SSSE3 = "       + std::to_string(ggml_cpu_has_ssse3())       + " | ";
     s += "VSX = "         + std::to_string(ggml_cpu_has_vsx())         + " | ";
     s += "MATMUL_INT8 = " + std::to_string(ggml_cpu_has_matmul_int8()) + " | ";
+#ifdef GGML_USE_LLAMAFILE
+    s += "LLAMAFILE = 1 | ";
+#else
+    s += "LLAMAFILE = 0 | ";
+#endif
 
     return s.c_str();
 }
@@ -15248,6 +18624,8 @@ void llama_log_set(ggml_log_callback log_callback, void * user_data) {
     g_state.log_callback_user_data = user_data;
 #ifdef GGML_USE_METAL
     ggml_backend_metal_log_set_callback(g_state.log_callback, g_state.log_callback_user_data);
+#elif defined(GGML_USE_CUDA)
+    ggml_backend_cuda_log_set_callback(g_state.log_callback, g_state.log_callback_user_data);
 #endif
 }
 

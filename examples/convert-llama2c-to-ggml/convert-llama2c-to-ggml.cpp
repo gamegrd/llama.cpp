@@ -774,7 +774,7 @@ static struct train_params get_default_train_params() {
 
     params.samples_start_after_nl = false;
     params.use_adam               = true;
-    params.use_flash              = true;
+    params.use_flash              = false;
     params.use_scratch            = true;
 
     // only adam
@@ -880,7 +880,7 @@ int main(int argc, char ** argv) {
     TransformerWeights weights = {};
     {
         LOG("%s: Loading llama2c model from %s\n", __func__, params.fn_llama2c_model);
-        FILE *file = fopen(params.fn_llama2c_model, "r");
+        FILE * file = fopen(params.fn_llama2c_model, "rb");
         if (!file) {
             LOG("%s: Unable to open the checkpoint file %s!\n", __func__, params.fn_llama2c_model);
             return 1;

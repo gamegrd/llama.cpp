@@ -47,9 +47,6 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
-set(TARGET json-schema-to-grammar)
-add_library(${TARGET} OBJECT json-schema-to-grammar.cpp json-schema-to-grammar.h)
-
 set(TARGET common)
 
 add_library(${TARGET} STATIC
@@ -63,6 +60,7 @@ add_library(${TARGET} STATIC
     grammar-parser.h
     grammar-parser.cpp
     json.hpp
+    json-schema-to-grammar.cpp
     train.h
     train.cpp
     ngram-cache.h
@@ -86,4 +84,4 @@ endif ()
 
 target_include_directories(${TARGET} PUBLIC .)
 target_compile_features(${TARGET} PUBLIC cxx_std_11)
-target_link_libraries(${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama)
+target_link_libraries(${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)

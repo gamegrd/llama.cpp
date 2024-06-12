@@ -49,6 +49,12 @@ static void batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
         }
 
         float * out = output + batch.seq_id[i][0] * n_embd;
+        //TODO: I would also add a parameter here to enable normalization or not.
+        /*fprintf(stdout, "unnormalized_embedding:");
+        for (int hh = 0; hh < n_embd; hh++) {
+            fprintf(stdout, "%9.6f ", embd[hh]);
+        }
+        fprintf(stdout, "\n");*/
         llama_embd_normalize(embd, out, n_embd);
     }
 }
@@ -57,10 +63,13 @@ int main(int argc, char ** argv) {
     gpt_params params;
 
     if (!gpt_params_parse(argc, argv, params)) {
+        gpt_params_print_usage(argc, argv, params);
         return 1;
     }
 
     params.embedding = true;
+    // For non-causal models, batch size must be equal to ubatch size
+    params.n_ubatch = params.n_batch;
 
     print_build_info();
 
@@ -71,9 +80,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "%s: seed  = %u\n", __func__, params.seed);
 
     std::mt19937 rng(params.seed);
-    if (params.random_prompt) {
-        params.prompt = gpt_random_prompt(rng);
-    }
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -99,7 +105,7 @@ int main(int argc, char ** argv) {
     // print system information
     {
         fprintf(stderr, "\n");
-        fprintf(stderr, "%s\n", get_system_info(params).c_str());
+        fprintf(stderr, "%s\n", gpt_params_get_system_info(params).c_str());
     }
 
     // split the prompt into lines
@@ -114,15 +120,19 @@ int main(int argc, char ** argv) {
     for (const auto & prompt : prompts) {
         auto inp = ::llama_tokenize(ctx, prompt, true, false);
         if (inp.size() > n_batch) {
-            inp.resize(n_batch);
+            fprintf(stderr, "%s: error: number of tokens in input line (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
+                    __func__, (long long int) inp.size(), (long long int) n_batch);
+            return 1;
         }
         inputs.push_back(inp);
     }
 
-    // add eos if not present
+    // check if the last token is SEP
+    // it should be automatically added by the tokenizer when 'tokenizer.ggml.add_eos_token' is set to 'true'
     for (auto & inp : inputs) {
-        if (inp.empty() || inp.back() != llama_token_eos(model)) {
-            inp.push_back(llama_token_eos(model));
+        if (inp.empty() || inp.back() != llama_token_sep(model)) {
+            fprintf(stderr, "%s: warning: last token in the prompt is not SEP\n", __func__);
+            fprintf(stderr, "%s:          'tokenizer.ggml.add_eos_token' should be set to 'true' in the GGUF header\n", __func__);
         }
     }
 
@@ -174,29 +184,32 @@ int main(int argc, char ** argv) {
     float * out = emb + p * n_embd;
     batch_decode(ctx, batch, out, s, n_embd);
 
-    // print the first part of the embeddings
+    // print the first part of the embeddings or for a single prompt, the full embedding
     fprintf(stdout, "\n");
     for (int j = 0; j < n_prompts; j++) {
         fprintf(stdout, "embedding %d: ", j);
-        for (int i = 0; i < std::min(16, n_embd); i++) {
+        for (int i = 0; i < (n_prompts > 1 ? std::min(16, n_embd) : n_embd); i++) {
             fprintf(stdout, "%9.6f ", emb[j * n_embd + i]);
         }
         fprintf(stdout, "\n");
     }
 
     // print cosine similarity matrix
-    fprintf(stdout, "\n");
-    printf("cosine similarity matrix:\n\n");
-    for (int i = 0; i < n_prompts; i++) {
-        for (int j = 0; j < n_prompts; j++) {
-            float sim = llama_embd_similarity_cos(emb + i * n_embd, emb + j * n_embd, n_embd);
-            fprintf(stdout, "%6.2f ", sim);
-        }
+    if (n_prompts > 1) {
         fprintf(stdout, "\n");
+        printf("cosine similarity matrix:\n\n");
+        for (int i = 0; i < n_prompts; i++) {
+            for (int j = 0; j < n_prompts; j++) {
+                float sim = llama_embd_similarity_cos(emb + i * n_embd, emb + j * n_embd, n_embd);
+                fprintf(stdout, "%6.2f ", sim);
+            }
+            fprintf(stdout, "\n");
+        }
     }
 
     // clean up
     llama_print_timings(ctx);
+    llama_batch_free(batch);
     llama_free(ctx);
     llama_free_model(model);
     llama_backend_free();

@@ -137,7 +137,7 @@ extern "C" {
     /*
       Example usage:
 
-        // operations that use tensors allocated in a buffer with USAGE_WEIGHTS will be asigned
+        // operations that use tensors allocated in a buffer with USAGE_WEIGHTS will be assigned
         // preferrably to run on the same backend as the buffer
         ggml_backend_buffer_set_usage(buf_weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
@@ -225,7 +225,7 @@ extern "C" {
 
     // Tensor initialization
     GGML_API void ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr);
-    GGML_API void ggml_backend_view_init(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor);
+    GGML_API void ggml_backend_view_init(struct ggml_tensor * tensor);
 
 
 #ifdef  __cplusplus
